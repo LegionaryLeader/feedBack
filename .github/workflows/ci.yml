@@ -1,0 +1,125 @@
+name: ci
+
+# Runs only as a reusable workflow invoked by ship-ci.yml (for PRs into main
+# and release/**). It deliberately has no standalone pull_request trigger: a
+# direct run would publish unprefixed "<job>" checks, but the org rulesets
+# require the "ci / <job>" names produced when ship-ci.yml calls this workflow.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Guard against print() / traceback.print_exc() in server.py, lib/, and bundled plugin routes
+        run: |
+          # git grep: tracked files only — no .pyc / __pycache__ noise from
+          # later pytest runs. Covers both audited patterns from #155 / #242.
+          # `(^|[^A-Za-z0-9_])` anchor avoids matching suffixes like `myprint(`;
+          # POSIX leaves `\b` undefined, so we use an explicit character class.
+          hits=$(git grep -nE '(^|[^A-Za-z0-9_])(print|traceback\.print_exc)[[:space:]]*\(' \
+            -- server.py lib/ \
+            $(git ls-files 'plugins/*/routes.py') || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            first=$(printf '%s\n' "$hits" | head -n1)
+            file=$(printf '%s' "$first" | cut -d: -f1)
+            line=$(printf '%s' "$first" | cut -d: -f2)
+            echo "::error file=${file},line=${line}::print() or traceback.print_exc() found in server.py, lib/, or a bundled plugin routes.py. Use the slopsmith logger (lib/logging_setup.py) — see issues #155 / #242."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Run pytest
+        run: pytest
+
+      - name: Run JS plugin-API tests
+        run: node --test tests/js/*.test.js 'tests/plugins/*/js/*.test.js'
+
+  tailwind-fresh:
+    # Guard that the committed static/tailwind.min.css is in sync with source.
+    # The Play CDN's runtime JIT was removed (slopsmith-desktop#110); a prebuilt
+    # stylesheet only contains classes the scanner saw at build time, so stale
+    # CSS silently ships unstyled elements. Rebuild and fail on any diff.
+    name: tailwind-fresh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Rebuild Tailwind CSS
+        run: bash scripts/build-tailwind.sh
+
+      - name: Verify committed static/tailwind.min.css is fresh
+        run: |
+          # Hard-fail (matches the print() guard convention) — do NOT auto-commit.
+          if ! git diff --quiet -- static/tailwind.min.css; then
+            echo "::error file=static/tailwind.min.css::static/tailwind.min.css is stale. Run 'bash scripts/build-tailwind.sh' and commit the regenerated file."
+            git diff -- static/tailwind.min.css
+            exit 1
+          fi
+
+  manifest-validation:
+    name: manifest-validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate plugin manifests
+        run: |
+          python - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          errors = []
+          manifests = sorted(Path("plugins").glob("*/plugin.json"))
+
+          for manifest in manifests:
+              try:
+                  data = json.loads(manifest.read_text())
+              except json.JSONDecodeError as e:
+                  errors.append(f"{manifest}: invalid JSON — {e}")
+                  continue
+              for field in ("id", "name"):
+                  if field not in data:
+                      errors.append(f"{manifest}: missing required field '{field}'")
+              pid = data.get("id", "")
+              if pid and pid != pid.lower():
+                  errors.append(f"{manifest}: 'id' must be lowercase, got '{pid}'")
+              # The plugin loader treats each plugins/<dir> as a Python module,
+              # so the manifest 'id' must match its directory name.
+              dirname = manifest.parent.name
+              if pid and pid != dirname:
+                  errors.append(f"{manifest}: 'id' ({pid!r}) must match directory name ({dirname!r})")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          print(f"Validated {len(manifests)} manifest(s) — OK")
+          EOF

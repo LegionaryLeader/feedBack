@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="fee[dB]ack">
+  <!-- fee[dB]ack app mark: the [dB] motif (decibel pun) on the navy tile.
+       Sky dB with dimmer brackets; legible down to favicon sizes. -->
+  <rect width="64" height="64" rx="14" fill="#111827"/>
+  <text x="32" y="33" text-anchor="middle" dominant-baseline="central"
+        font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif"
+        font-weight="800" font-size="30" letter-spacing="-1">
+    <tspan fill="#94a3b8">[</tspan><tspan fill="#0ea5e9">dB</tspan><tspan fill="#94a3b8">]</tspan>
+  </text>
+</svg>
