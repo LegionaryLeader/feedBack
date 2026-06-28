@@ -10123,9 +10123,14 @@ function openEditModal(songData, openerEl) {
                     <input type="text" id="edit-album" value="${_escAttr(songData.al)}"
                         class="w-full bg-dark-600 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 outline-none focus:border-accent/50">
                 </div>
+                <div>
+                    <label class="text-xs text-gray-400 mb-1 block">Year</label>
+                    <input type="text" inputmode="numeric" id="edit-year" value="${_escAttr(songData.y)}" placeholder="e.g. 2024"
+                        class="w-full bg-dark-600 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 outline-none focus:border-accent/50">
+                </div>
             </div>
             <div class="flex gap-3 mt-5">
-                <button onclick="saveEditModal('${encodeURIComponent(songData.f)}')"
+                <button data-edit-save
                     class="flex-1 bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-sm font-semibold text-white transition">Save</button>
                 <button data-edit-close
                     class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 transition">Cancel</button>
@@ -10161,6 +10166,16 @@ function openEditModal(songData, openerEl) {
         document.getElementById('edit-art-file').click();
     });
 
+    // Save — wired in JS (not an inline onclick) so the filename never has to
+    // survive embedding in a single-quoted attribute string. encodeURIComponent
+    // does NOT escape `'`, so a filename like `Bob's Song.sloppak` used to break
+    // the inline `saveEditModal('…')` handler and silently fail the save. The
+    // raw filename lives in the closure; encode it here for saveEditModal.
+    const saveBtn = modal.querySelector('[data-edit-save]');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', () => saveEditModal(encodeURIComponent(songData.f)));
+    }
+
     const deleteBtn = modal.querySelector('[data-delete-filename]');
     if (deleteBtn) {
         deleteBtn.addEventListener('click', () => {
@@ -10169,15 +10184,32 @@ function openEditModal(songData, openerEl) {
     }
 
     // Close on backdrop click or Cancel button; restore focus to opener.
+    // Backdrop dismissal requires the gesture's mousedown to have STARTED on
+    // the backdrop — not just the click/mouseup to land there. Otherwise a
+    // click-drag that begins inside a field (e.g. selecting text) and is
+    // released past the modal edge resolves its `click` target to the backdrop
+    // and silently discards the edit. Cancel / ✕ (data-edit-close) always close.
+    let _downOnBackdrop = false;
+    modal.addEventListener('mousedown', (e) => { _downOnBackdrop = (e.target === modal); });
     modal.addEventListener('click', (e) => {
-        if (e.target === modal || e.target.closest('[data-edit-close]')) {
-            const opener = modal._opener;
-            modal.remove();
-            const focusTarget = (opener && document.body.contains(opener)) ? opener
-                : (_lastLibSelected && document.body.contains(_lastLibSelected) ? _lastLibSelected : null);
-            if (focusTarget) focusTarget.focus({ preventScroll: true });
-        }
+        if (!_editModalShouldClose(e.target, modal, _downOnBackdrop)) return;
+        const opener = modal._opener;
+        modal.remove();
+        const focusTarget = (opener && document.body.contains(opener)) ? opener
+            : (_lastLibSelected && document.body.contains(_lastLibSelected) ? _lastLibSelected : null);
+        if (focusTarget) focusTarget.focus({ preventScroll: true });
     });
+}
+
+// Whether a click on the edit-metadata modal should dismiss it. The Cancel / ✕
+// control (data-edit-close) always dismisses. A backdrop dismissal needs BOTH
+// the click target to be the backdrop element itself AND the gesture to have
+// started there (downOnBackdrop) — so a click-drag begun inside a field and
+// released on the backdrop does not discard the form. Pure + top-level so it's
+// unit-testable in isolation.
+function _editModalShouldClose(clickTarget, modalEl, downOnBackdrop) {
+    if (clickTarget && clickTarget.closest && clickTarget.closest('[data-edit-close]')) return true;
+    return clickTarget === modalEl && downOnBackdrop === true;
 }
 
 function previewEditArt(input) {
@@ -10200,6 +10232,9 @@ async function saveEditModal(encodedFilename) {
             title: document.getElementById('edit-title').value.trim(),
             artist: document.getElementById('edit-artist').value.trim(),
             album: document.getElementById('edit-album').value.trim(),
+            // Year is normalised server-side (non-numeric/empty → ""), so a
+            // blank or cleared field round-trips safely.
+            year: document.getElementById('edit-year').value.trim(),
         }),
     });
 
