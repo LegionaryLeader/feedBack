@@ -3,8 +3,8 @@
  *
  * Bridges the highway note-detection scorer to the core song_stats store
  * (POST /api/stats). The scorer lives in the OPTIONAL external plugin
- * slopsmith-plugin-notedetect, which emits `note:hit` / `note:miss` per note
- * on window.slopsmith — note-detection is a DEFERRED capability domain, so we
+ * feedBack-plugin-notedetect, which emits `note:hit` / `note:miss` per note
+ * on window.feedBack — note-detection is a DEFERRED capability domain, so we
  * use those legacy events directly (design/05-capability-pipelines.md). If the
  * plugin isn't installed, no note events fire and nothing is recorded
  * (graceful degrade — the dashboard simply shows no accuracy).
@@ -21,7 +21,7 @@
  */
 (function () {
     'use strict';
-    const sm = window.slopsmith;
+    const sm = window.feedBack;
     if (!sm || typeof sm.on !== 'function') return;
 
     let cur = null;             // active session
@@ -101,6 +101,9 @@
             if (window.v3Profile && typeof window.v3Profile.refresh === 'function') {
                 window.v3Profile.refresh();
             }
+            // Tell the library the song's best score may have changed so its
+            // card/list badge refreshes without waiting for a restart.
+            sm.emit('stats:recorded', { filename: body.filename, arrangement: body.arrangement });
         });
     }
 
@@ -157,6 +160,7 @@
             // treat it as a natural finish for calibration-retry feedback.
             await notifyProgression(response, body, true);
             if (window.v3Profile && typeof window.v3Profile.refresh === 'function') window.v3Profile.refresh();
+            sm.emit('stats:recorded', { filename: body.filename, arrangement: body.arrangement });
         });
     });
 

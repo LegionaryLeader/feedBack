@@ -15,10 +15,10 @@
 (function () {
     'use strict';
 
-    window.slopsmith = window.slopsmith || {};
-    if (window.slopsmithInputSetup && window.slopsmithInputSetup.version === 1) return;
+    window.feedBack = window.feedBack || {};
+    if (window.feedBackInputSetup && window.feedBackInputSetup.version === 1) return;
 
-    const capabilities = window.slopsmith.capabilities;
+    const capabilities = window.feedBack.capabilities;
     const DONE_KEY = (inst) => `input_setup.done.${inst}`;
     const INSTRUMENTS = {
         guitar: { label: 'Guitar', mode: 'audio' },
@@ -36,7 +36,7 @@
 
     // The Web-MIDI source provider now ships built-in with the core midi-input
     // domain (static/capabilities/midi-input.js), so input_setup is a pure
-    // consumer — it just discovers/selects/opens through `window.slopsmith.midiInput`.
+    // consumer — it just discovers/selects/opens through `window.feedBack.midiInput`.
 
     // ── audio-input helper (guitar/bass device context) ─────────────────────
     async function _audioSources() {
@@ -51,15 +51,16 @@
             sources = sources.filter((s) => s
                 && !/midi/i.test(String(s.providerId || ''))
                 && !/^midi-input/i.test(String(s.label || '')));
-            // De-dupe by display label — the desktop engine enumerates the same
-            // device under several driver types, so the same name can repeat.
-            const seen = new Set();
-            sources = sources.filter((s) => {
-                const key = String(s.label || '').toLowerCase();
-                if (seen.has(key)) return false;
-                seen.add(key);
-                return true;
-            });
+            // No label de-dupe here. The audio-input capability already
+            // collapses exact duplicates by logicalSourceKey
+            // (_visibleInputSources), so nothing it returns shares a key. A
+            // device that enumerates under several driver types (ASIO / Windows
+            // Audio / DirectSound) has a DISTINCT key per type and is now
+            // labelled with its driver type (e.g. "Focusrite (ASIO)") — each is
+            // a real, separately-selectable input the user must be able to see.
+            // The old bare-label collapse also kept whichever variant sorted
+            // first, which could silently drop the one that was actually
+            // `selected` below.
             const selected = sources.find((s) => s && s.selected) || null;
             return { sources, selected };
         } catch (_) { return { sources: [], selected: null }; }
@@ -163,10 +164,25 @@
 
                 host.querySelector('[data-is-cal]').addEventListener('click', () => {
                     if (hasDetector) {
+                        // Hide our own full-screen overlay while note_detect's
+                        // Calibration Wizard runs on top. That wizard goes
+                        // transparent (pointer-events:none) when it minimizes to
+                        // expose the Tuner; if our overlay stayed up it would show
+                        // through — covering the tuner with the still-mounted
+                        // "select your input" card and looking like a second
+                        // wizard at the input step. Restore it on done/cancel
+                        // (one of which always fires when that wizard closes).
+                        const ov = document.getElementById('input-setup-overlay');
+                        const prevDisplay = ov ? ov.style.display : '';
+                        if (ov) ov.style.display = 'none';
+                        const restore = () => {
+                            const o = document.getElementById('input-setup-overlay');
+                            if (o) o.style.display = prevDisplay;
+                        };
                         window.noteDetect.launchCalibration({
                             instrument: inst,
-                            onDone: () => advance(inst, true),
-                            onCancel: () => { /* stay on this panel; user can skip or retry */ },
+                            onDone: () => { restore(); advance(inst, true); },
+                            onCancel: () => { restore(); /* stay on this panel; user can skip or retry */ },
                         });
                     } else {
                         advance(inst, true);
@@ -176,7 +192,7 @@
 
             // Keys/drums: pick a MIDI device via midi-input and confirm a live hit.
             async function renderMidiPanel(inst) {
-                const mi = window.slopsmith.midiInput;
+                const mi = window.feedBack.midiInput;
                 // Availability is the midi-input DOMAIN being present, not the
                 // Web-MIDI browser API — the domain coordinates providers (the
                 // built-in Web-MIDI one, plus any native/desktop adapter), so
@@ -249,7 +265,7 @@
                     // Show every source the midi-input domain surfaces — not just
                     // the built-in Web-MIDI provider — so a native/desktop MIDI
                     // adapter registered with the domain is selectable too.
-                    const sources = window.slopsmith.midiInput.listSources() || [];
+                    const sources = window.feedBack.midiInput.listSources() || [];
                     if (!sources.length) { testEl && (testEl.textContent = ''); wrap.classList.remove('hidden'); select.innerHTML = '<option>No MIDI devices found</option>'; select.disabled = true; return; }
                     wrap.classList.remove('hidden');
                     select.disabled = false;
@@ -327,7 +343,7 @@
         return _runWizard({ host, instruments: instruments || [] }).then((r) => { overlay.remove(); return r; });
     }
 
-    window.slopsmithInputSetup = {
+    window.feedBackInputSetup = {
         version: 1,
         mount,
         launch,

@@ -1,5 +1,5 @@
 """Tests for server.py /api/settings — partial-update safety and the
-master_difficulty key added in slopsmith#48 PR 2.
+master_difficulty key added in feedBack#48 PR 2.
 
 The endpoint must merge only keys present in the request body so that
 single-key POSTs (like the difficulty slider's oninput fire-and-forget)
@@ -35,9 +35,11 @@ class _DirectSettingsClient:
         return _DirectResponse(self._server.get_settings())
 
     def post(self, path, json):
-        if path != "/api/settings":
-            raise ValueError(f"unsupported path: {path}")
-        return _DirectResponse(self._server.save_settings(json))
+        if path == "/api/settings":
+            return _DirectResponse(self._server.save_settings(json))
+        if path == "/api/settings/reset":
+            return _DirectResponse(self._server.reset_settings(json))
+        raise ValueError(f"unsupported path: {path}")
 
     def close(self):
         pass
@@ -55,7 +57,7 @@ def client(tmp_path, monkeypatch):
     # Forcing a fresh import inside the patched env means each test
     # gets an isolated meta_db + config dir.
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     test_client = _DirectSettingsClient(server)
@@ -479,7 +481,7 @@ def test_is_first_scan_false_when_some_songs_cached(tmp_path, scan_module):
 # and side-effect-free, but that bypass means the FastAPI route registration,
 # request parsing, and lifespan/startup wiring would never get exercised. The
 # tests below restore that coverage by going through a real `TestClient`, with
-# `SLOPSMITH_SKIP_STARTUP_TASKS=1` so plugin loading and the background scan
+# `FEEDBACK_SKIP_STARTUP_TASKS=1` so plugin loading and the background scan
 # don't reach for the user's filesystem.
 
 def _snapshot_loaded_plugins():
@@ -507,13 +509,13 @@ def api_client(tmp_path, monkeypatch, isolate_logging):
     which is the only place the skip-tasks branch is actually exercised.
 
     Pulls in `isolate_logging` from tests/conftest.py — the startup hook
-    calls `configure_logging()`, which mutates global slopsmith/uvicorn
+    calls `configure_logging()`, which mutates global feedBack/uvicorn
     handlers and structlog defaults; without snapshot/restore those
     changes leak into later tests and the suite becomes order-dependent."""
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     plugins_snapshot = _snapshot_loaded_plugins()
     server = importlib.import_module("server")
@@ -580,8 +582,24 @@ def test_api_post_settings_null_string_is_noop_via_testclient(api_client, tmp_pa
     assert _read_cfg(tmp_path)["master_difficulty"] == 50
 
 
+def test_achievements_enabled_persists_and_validates(api_client, tmp_path):
+    """The achievements-epic opt-in flag round-trips as a boolean and rejects
+    non-bools at the route level (mirrors countdown_before_song)."""
+    tc, _server = api_client
+    r = tc.post("/api/settings", json={"achievements_enabled": True})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)["achievements_enabled"] is True
+    bad = tc.post("/api/settings", json={"achievements_enabled": "yes"})
+    assert bad.status_code == 200 and "error" in bad.json()
+
+
+def test_achievements_enabled_is_resettable(server_module):
+    """The flag is in the resettable allow-list so a Reset clears it to default."""
+    assert "achievements_enabled" in server_module._RESETTABLE_SETTINGS_KEYS
+
+
 def test_skip_startup_tasks_drives_startup_to_complete(api_client):
-    """With SLOPSMITH_SKIP_STARTUP_TASKS set, the startup hook must:
+    """With FEEDBACK_SKIP_STARTUP_TASKS set, the startup hook must:
       * skip plugin loading and the background scan,
       * leave the status in a terminal `complete` phase with running=False,
       * reset current_plugin/loaded/total so stale data from a prior import
@@ -608,7 +626,7 @@ def test_skip_startup_tasks_does_not_call_load_plugins_or_scan(tmp_path, monkeyp
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     plugins_snapshot = _snapshot_loaded_plugins()
     server = importlib.import_module("server")
@@ -650,7 +668,7 @@ def test_skip_startup_tasks_clears_stale_plugin_registry(tmp_path, monkeypatch, 
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
 
     # Snapshot the registry as the importer left it so we can restore it
     # after this test mutates it — otherwise the cleared state would leak
@@ -682,3 +700,91 @@ def test_skip_startup_tasks_clears_stale_plugin_registry(tmp_path, monkeypatch, 
         if conn is not None:
             conn.close()
         _restore_loaded_plugins(plugins_snapshot)
+
+
+# ── v0.3.0 gameplay settings (tabbed settings page) ─────────────────────────
+
+def test_countdown_before_song_persists_bool(client, tmp_path):
+    r = client.post("/api/settings", json={"countdown_before_song": True})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)["countdown_before_song"] is True
+    client.post("/api/settings", json={"countdown_before_song": False})
+    assert _read_cfg(tmp_path)["countdown_before_song"] is False
+
+
+@pytest.mark.parametrize("bad_value", [1, 0, "true", "yes", [], {}])
+def test_countdown_before_song_rejects_non_bool(client, tmp_path, bad_value):
+    (tmp_path / "config.json").write_text(json.dumps({"countdown_before_song": True}))
+    r = client.post("/api/settings", json={"countdown_before_song": bad_value})
+    assert "error" in r.json()
+    # Previous value preserved on bad input.
+    assert _read_cfg(tmp_path)["countdown_before_song"] is True
+
+
+@pytest.mark.parametrize("key,good,bad", [
+    ("miss_penalty", "high", "extreme"),
+    ("fail_behavior", "restart", "explode"),
+])
+def test_enum_settings_validate(client, tmp_path, key, good, bad):
+    r = client.post("/api/settings", json={key: good})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)[key] == good
+    # Bad enum value is rejected and doesn't clobber the persisted good one.
+    r = client.post("/api/settings", json={key: bad})
+    assert "error" in r.json()
+    assert _read_cfg(tmp_path)[key] == good
+
+
+def test_defaults_include_gameplay_keys(client, tmp_path):
+    # Fresh install (no config.json) — GET should expose the new keys at their
+    # neutral defaults so the frontend hydrates predictably.
+    data = client.get("/api/settings").json()
+    assert data["countdown_before_song"] is False
+    assert data["miss_penalty"] == "none"
+    assert data["fail_behavior"] == "continue"
+
+
+# ── /api/settings/reset ─────────────────────────────────────────────────────
+
+def test_reset_clears_requested_keys(client, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "master_difficulty": 40,
+        "countdown_before_song": True,
+        "default_arrangement": "Lead",
+        "demucs_server_url": "http://demucs.example:9000",
+    }))
+    r = client.post("/api/settings/reset",
+                    json={"keys": ["master_difficulty", "countdown_before_song"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["reset"]) == {"master_difficulty", "countdown_before_song"}
+    cfg = _read_cfg(tmp_path)
+    # Reset removes the key so GET falls back to the default.
+    assert "master_difficulty" not in cfg
+    assert "countdown_before_song" not in cfg
+    # Unlisted keys are untouched.
+    assert cfg["default_arrangement"] == "Lead"
+    assert cfg["demucs_server_url"] == "http://demucs.example:9000"
+
+
+def test_reset_ignores_unknown_keys(client, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"master_difficulty": 40}))
+    # Unknown / non-resettable keys are silently ignored, not an error, and
+    # can't be used to delete arbitrary config.
+    r = client.post("/api/settings/reset",
+                    json={"keys": ["dlc_dir", "not_a_real_key", "master_difficulty"]})
+    assert r.status_code == 200
+    assert r.json()["reset"] == ["master_difficulty"]
+    assert "master_difficulty" not in _read_cfg(tmp_path)
+
+
+def test_reset_bad_body_returns_error(client, tmp_path):
+    r = client.post("/api/settings/reset", json={"keys": "master_difficulty"})
+    assert "error" in r.json()
+
+
+def test_reset_with_no_config_is_noop(client, tmp_path):
+    # No config.json yet — already at defaults, nothing to remove.
+    r = client.post("/api/settings/reset", json={"keys": ["master_difficulty"]})
+    assert r.status_code == 200
+    assert r.json()["reset"] == []

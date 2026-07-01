@@ -26,13 +26,13 @@
     let openPop = null;       // { btn, pop }
 
     // ── v3 UI signal + plugin-control slot API ───────────────────────────────
-    // Lets plugins detect v3 (window.slopsmith.uiVersion === 'v3') and mount
+    // Lets plugins detect v3 (window.feedBack.uiVersion === 'v3') and mount
     // controls into a stable slot instead of the auto-hiding transport.
-    window.slopsmith = window.slopsmith || {};
-    window.slopsmith.uiVersion = 'v3';
-    window.slopsmith.ui = window.slopsmith.ui || {};
-    window.slopsmith.ui.version = 'v3';
-    window.slopsmith.ui.playerControlSlot = function () { return $('v3-plugin-controls-slot'); };
+    window.feedBack = window.feedBack || {};
+    window.feedBack.uiVersion = 'v3';
+    window.feedBack.ui = window.feedBack.ui || {};
+    window.feedBack.ui.version = 'v3';
+    window.feedBack.ui.playerControlSlot = function () { return $('v3-plugin-controls-slot'); };
 
     // ── Plugin-control re-homing shim ────────────────────────────────────────
     // Legacy plugins inject controls into #player-controls (now an auto-hiding
@@ -172,6 +172,8 @@
     function updateUpNext() {
         const pill = $('v3-upnext');
         if (!pill) return;
+        // Gated by the core "Show 'Up Next'" pref (Gameplay tab, default ON).
+        if (window.feedBack && window.feedBack.showUpNext === false) { pill.classList.add('hidden'); return; }
         const hw = window.highway;
         const secs = (hw && typeof hw.getSections === 'function') ? hw.getSections() : null;
         const t = (hw && typeof hw.getTime === 'function') ? hw.getTime() : null;
@@ -185,6 +187,19 @@
         const nm = $('v3-upnext-name'), eta = $('v3-upnext-eta');
         if (nm) nm.textContent = next.name || '—';
         if (eta) eta.textContent = 'in ' + dt.toFixed(1) + 's';
+        // Progress bar: fraction of the current section elapsed toward `next`.
+        // Previous boundary is the last section at/before now (else song start).
+        const fill = $('v3-upnext-bar-fill');
+        if (fill) {
+            let prevT = 0;
+            for (let i = 0; i < secs.length; i++) {
+                if (typeof secs[i].time === 'number' && secs[i].time <= t) prevT = secs[i].time;
+                else break;
+            }
+            const span = next.time - prevT;
+            const prog = span > 0 ? Math.max(0, Math.min(1, (t - prevT) / span)) : 0;
+            fill.style.width = (prog * 100).toFixed(1) + '%';
+        }
         pill.classList.remove('hidden');
     }
 

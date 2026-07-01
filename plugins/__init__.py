@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from safepath import safe_join
 
-log = logging.getLogger("slopsmith.plugins")
+log = logging.getLogger("feedBack.plugins")
 
 
 PLUGINS_DIR = Path(__file__).parent
@@ -43,7 +43,7 @@ PLUGINS_LOCK = threading.RLock()
 # registry mutation (the pending seed, _graduate, _mark_failed) re-checks it
 # under the lock before touching LOADED_PLUGINS / PENDING_PLUGINS. This keeps a
 # still-running loader from an EARLIER pass — e.g. a "reload plugins" action,
-# SLOPSMITH_SYNC_STARTUP hot-reload, or test teardown re-invoking load_plugins()
+# FEEDBACK_SYNC_STARTUP hot-reload, or test teardown re-invoking load_plugins()
 # while the first pass's background install thread is mid-flight — from
 # repopulating or duplicating entries after a NEWER pass has already cleared the
 # registries. Only the latest pass is allowed to publish.
@@ -512,7 +512,7 @@ def _capability_warnings(manifest: dict, plugin_id: str) -> tuple[dict, list[dic
         if isinstance(declaration.get("provider_policy"), dict):
             clean["provider_policy"] = declaration["provider_policy"]
         # Declarative per-instance control descriptors a consuming host renders
-        # generically (slopsmith#849). Domain-agnostic: validated for any
+        # generically (feedBack#849). Domain-agnostic: validated for any
         # capability here and surfaced via /api/plugins; each domain defines how
         # a value is applied (visualization is the first consumer).
         if clean_settings:
@@ -567,7 +567,7 @@ def _load_plugin_sibling(plugin_id: str, plugin_dir: Path, name: str):
     import precedence). Mirrors the routes-loading pattern in
     `load_plugins()` and shares its `sys.modules` cache, so two plugins
     that each ship `extractor.py` get distinct cached modules instead
-    of stomping each other through `sys.path`. See slopsmith#33."""
+    of stomping each other through `sys.path`. See feedBack#33."""
     if not isinstance(plugin_id, str) or not plugin_id:
         raise ValueError(
             f"load_sibling: plugin_id must be a non-empty string, got {plugin_id!r}"
@@ -613,7 +613,7 @@ def _load_plugin_sibling(plugin_id: str, plugin_dir: Path, name: str):
     #     sys.modules entry — same key load_sibling produces
     # `setdefault` is atomic under the GIL so two threads racing to
     # create the parent can't overwrite each other's registration.
-    # Spotted by codex/Copilot reviews on PRs for slopsmith#33.
+    # Spotted by codex/Copilot reviews on PRs for feedBack#33.
     import types
     new_parent = types.ModuleType(parent_name)
     new_parent.__path__ = [str(plugin_dir)]
@@ -641,14 +641,14 @@ def _warn_on_module_collisions(plugin_specs):
     """Scan top-level importable modules across all plugins about to
     be loaded. Print a warning for any module name shipped by 2+
     plugins, since bare `import <name>` from those plugins will hit
-    the sys.path-based cache and cross-load (slopsmith#33).
+    the sys.path-based cache and cross-load (feedBack#33).
 
     Both top-level `.py` files AND top-level packages (directories
     containing `__init__.py`) are scanned — the same collision
     pattern applies to either, e.g. one plugin's `extractor.py` vs
     another plugin's `extractor/__init__.py` both produce a shared
     `sys.modules['extractor']` entry. Spotted by codex review on
-    PR for slopsmith#33.
+    PR for feedBack#33.
 
     `routes.py` itself is excluded because the loader already
     namespaces it as `plugin_{id}_routes`. Top-level dunder files
@@ -663,7 +663,7 @@ def _warn_on_module_collisions(plugin_specs):
     # — that intra-plugin layout is supported by load_sibling
     # (package form wins, matching CPython precedence) and shouldn't
     # trip a cross-plugin collision warning. Spotted by codex review
-    # on PR for slopsmith#33.
+    # on PR for feedBack#33.
     by_name: dict[str, dict[str, set[str]]] = {}
     for plugin_id, plugin_dir in plugin_specs:
         try:
@@ -700,7 +700,7 @@ def _warn_on_module_collisions(plugin_specs):
         log.warning(
             "Module-name collision: %r (%s) is shipped by %d plugins (%s). "
             "Bare `import %s` may load the wrong file. "
-            "Migrate to context['load_sibling']('%s') — see CLAUDE.md (slopsmith#33).",
+            "Migrate to context['load_sibling']('%s') — see CLAUDE.md (feedBack#33).",
             name, kind_label, len(by_plugin), ids_quoted, name, name,
         )
 
@@ -745,7 +745,7 @@ def _is_valid_tour_manifest(val) -> bool:
 def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
     """Validate and normalize a plugin's `settings.server_files` manifest
     list into clean POSIX-style relpaths suitable for the settings
-    export/import bundle (slopsmith#113).
+    export/import bundle (feedBack#113).
 
     Each entry must be a non-empty string with no absolute prefix and
     no `..` segment. A trailing `/` denotes a directory (recurse on
@@ -1118,7 +1118,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
 
     # Collect plugin directories — user plugins first so they override built-in
     plugin_dirs = []
-    user_plugins_dir = os.environ.get("SLOPSMITH_PLUGINS_DIR")
+    user_plugins_dir = os.environ.get("FEEDBACK_PLUGINS_DIR") or os.environ.get("SLOPSMITH_PLUGINS_DIR")
     if user_plugins_dir:
         user_path = Path(user_plugins_dir)
         if user_path.is_dir() and user_path != PLUGINS_DIR:
@@ -1179,7 +1179,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         )
 
     # Two-pass discovery so we can warn about cross-plugin module-name
-    # collisions BEFORE any plugin's setup runs (slopsmith#33). The
+    # collisions BEFORE any plugin's setup runs (feedBack#33). The
     # first pass collects (plugin_id, plugin_dir, manifest) tuples in
     # load order; the second pass actually executes each plugin's
     # setup with a per-plugin context.
@@ -1231,7 +1231,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 kept_is_bundled = _is_bundled(kept[1], kept[2]) if kept else False
                 if this_is_bundled and not kept_is_bundled:
                     # The incoming copy is the canonical bundled plugin; the
-                    # already-kept copy is user-installed (SLOPSMITH_PLUGINS_DIR
+                    # already-kept copy is user-installed (FEEDBACK_PLUGINS_DIR
                     # or cloned directly into plugins/). Bundled always wins —
                     # evict the user copy and fall through to register the
                     # bundled version instead.
@@ -1330,6 +1330,18 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         _category = manifest.get("category")
         if not isinstance(_category, str) or not _category:
             _category = None
+        # Settings-tab placement (tabbed settings page). When `settings` is a
+        # dict, an optional `category` field names which settings tab the
+        # plugin's panel mounts under (e.g. "graphics", "mic", "progression").
+        # Distinct from the top-level `category` above (which drives Pedalboard
+        # grouping) so the two don't collide. Absent/blank → None → the
+        # frontend falls back to the generic "Plugins" tab.
+        _settings_manifest = manifest.get("settings")
+        _settings_category = None
+        if isinstance(_settings_manifest, dict):
+            _sc = _settings_manifest.get("category")
+            if isinstance(_sc, str) and _sc:
+                _settings_category = _sc
         _icon = manifest.get("icon")
         if not isinstance(_icon, str) or not _icon:
             _icon = None
@@ -1338,6 +1350,13 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     _icon = "assets/thumb.png"
             except OSError:
                 _icon = None
+        # Immersive (full-screen) screen opt-in. A plugin that declares a
+        # top-level `"fullscreen": true` gets the whole content area when its
+        # screen is active: the v3 shell hides the topbar and collapses the
+        # sidebar to an icon rail (see static/v3/shell.js + v3.css). For
+        # DAW-style plugin UIs that need the viewport, not a scrolling content
+        # page. Strict `is True` so a stray truthy value can't silently opt in.
+        _fullscreen = manifest.get("fullscreen") is True
         return {
             "id": plugin_id,
             "name": manifest.get("name", plugin_id),
@@ -1355,6 +1374,10 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             "has_screen": bool(manifest.get("screen")),
             "has_script": bool(manifest.get("script")),
             "has_settings": bool(manifest.get("settings")),
+            "settings_category": _settings_category,
+            # Drives the v3 shell's immersive (full-screen) mode for this
+            # plugin's screen. False unless the manifest declares it explicitly.
+            "fullscreen": _fullscreen,
             "has_tour": _is_valid_tour_manifest(manifest.get("tour")),
             # `styles` is an optional relpath (under the plugin's assets/) to a
             # compiled, preflight-off stylesheet the frontend injects as a
@@ -1537,7 +1560,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             continue
 
         # Add plugin directory to sys.path so the plugin's bare
-        # `import sibling` keeps working during the slopsmith#33
+        # `import sibling` keeps working during the feedBack#33
         # transition. New plugins should prefer
         # `context['load_sibling']('sibling')` instead — see
         # CLAUDE.md / Plugin System / Backend routes.
@@ -1556,13 +1579,13 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         # bijectively encoded by _safe_plugin_id_for_module_name:
         # `_` -> `_5f_`, `.` -> `_2e_`) so two plugins shipping the
         # same filename get distinct cached modules. See
-        # slopsmith#33.
+        # feedBack#33.
         plugin_context = dict(context)
         plugin_context["load_sibling"] = (
             lambda name, _pid=plugin_id, _pdir=plugin_dir:
                 _load_plugin_sibling(_pid, _pdir, name)
         )
-        plugin_context["log"] = logging.getLogger(f"slopsmith.plugin.{plugin_id}")
+        plugin_context["log"] = logging.getLogger(f"feedBack.plugin.{plugin_id}")
         if callable(plugin_context.get("register_library_provider")):
             _register_library_provider = plugin_context["register_library_provider"]
 
@@ -1709,9 +1732,9 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             # Normalized list of relpaths under CONFIG_DIR that this
             # plugin opts in to settings export/import. Empty for
             # plugins that don't declare `settings.server_files`. See
-            # slopsmith#113.
+            # feedBack#113.
             "_export_paths": _normalize_export_paths(manifest.get("settings"), plugin_id),
-            # Diagnostics opt-in (slopsmith#166): same allowlist semantics
+            # Diagnostics opt-in (feedBack#166): same allowlist semantics
             # as `_export_paths` but for the troubleshooting bundle.
             "_diagnostics_paths": _normalize_diagnostics_paths(manifest.get("diagnostics"), plugin_id),
             "_diagnostics_callable_spec": _parse_diagnostics_callable(manifest.get("diagnostics"), plugin_id),
@@ -1800,7 +1823,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             lambda name, _pid=evicted_id, _pdir=ev_dir:
                 _load_plugin_sibling(_pid, _pdir, name)
         )
-        ev_context["log"] = logging.getLogger(f"slopsmith.plugin.{evicted_id}")
+        ev_context["log"] = logging.getLogger(f"feedBack.plugin.{evicted_id}")
         if callable(ev_context.get("register_library_provider")):
             _ev_register_library_provider = ev_context["register_library_provider"]
 
@@ -2053,7 +2076,7 @@ def register_plugin_api(app: FastAPI):
                 "category": p.get("category") if "category" in p else ((p.get("_manifest") or {}).get("category") or None),
                 "icon": p.get("icon") if "icon" in p else ((p.get("_manifest") or {}).get("icon") or None),
                 # `bundled` is reserved metadata flagging plugins that
-                # ship with the default container image (slopsmith#160).
+                # ship with the default container image (feedBack#160).
                 # Surfaced in /api/plugins so the plugin-list UI can
                 # render a "Bundled" badge (lock icon) next to the
                 # plugin name in the settings collapsible.
@@ -2067,6 +2090,11 @@ def register_plugin_api(app: FastAPI):
                 "has_screen": p["has_screen"],
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],
+                # v3 immersive screen opt-in (full-screen plugin UI).
+                "fullscreen": p.get("fullscreen", False),
+                # Settings-tab placement; None when the manifest's `settings`
+                # is absent, a bare string, or omits `category`.
+                "settings_category": p.get("settings_category"),
                 "has_tour": p.get("has_tour", False),
                 # `.get()` fallbacks keep stubbed test entries (built without
                 # _nav_entry) working — styles is None when unset.
@@ -2115,6 +2143,8 @@ def register_plugin_api(app: FastAPI):
                 "has_screen": e.get("has_screen", False),
                 "has_script": e.get("has_script", False),
                 "has_settings": e.get("has_settings", False),
+                "settings_category": e.get("settings_category"),
+                "fullscreen": e.get("fullscreen", False),
                 "has_tour": e.get("has_tour", False),
                 "has_styles": e.get("has_styles", False),
                 "styles": e.get("styles"),

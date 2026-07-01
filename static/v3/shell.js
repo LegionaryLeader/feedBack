@@ -17,6 +17,13 @@
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+    // Plugin ids whose manifest declared `"fullscreen": true`. Populated from
+    // /api/plugins in renderPromotedNav(); read by syncActive() to toggle the
+    // immersive (chrome-collapsed) shell whenever such a plugin's screen is the
+    // active one. Empty until plugins resolve — the worst case is one extra
+    // syncActive() once the fetch lands, which re-applies the class.
+    const FULLSCREEN_PLUGIN_IDS = new Set();
+
     // ── Navigation registry ────────────────────────────────────────────────
     // Each entry maps a stable hash key → a screen id (showScreen target) and a
     // label. Legacy screens are reused: "Songs" = #home (library), "Favorites"
@@ -40,8 +47,10 @@
         // other plugins are reached solely via the single "Plugins" entry
         // above. Screens are injected async by the plugin loader, so go()'s
         // plugin- guard applies.
-        { key: 'slopscale',   screen: 'plugin-slopscale',   label: 'SlopScale - Practice', group: null, icon: 'target' },
+        { key: 'virtuoso',    screen: 'plugin-virtuoso',    label: 'Virtuoso - Practice', group: null, icon: 'target' },
         { key: 'rig_builder', screen: 'plugin-rig_builder', label: 'Rig Builder', group: null,      icon: 'amp' },
+        { key: 'editor',      screen: 'plugin-editor',      label: 'Song Editor', group: null,      icon: 'edit' },
+        { key: 'audio_engine', screen: 'plugin-audio_engine', label: 'Audio', group: null,        icon: 'amp' },
         // Not in the sidebar groups, but routable (profile badge → here).
         { key: 'profile',   screen: 'v3-profile',   label: 'Profile',         group: null,      icon: 'user' },
     ];
@@ -50,8 +59,10 @@
     // group); a key that's the last item of the last group lands right after
     // that group. Each is gated on the plugin actually being installed.
     const PROMOTED_PLUGINS = [
-        { navKey: 'slopscale',   pluginId: 'slopscale',   slotId: 'v3-nav-slopscale',    anchorAfter: 'feedbarcade' },
+        { navKey: 'virtuoso',    pluginId: 'virtuoso',    slotId: 'v3-nav-virtuoso',    anchorAfter: 'feedbarcade' },
         { navKey: 'rig_builder', pluginId: 'rig_builder', slotId: 'v3-nav-rig-builder', anchorAfter: 'saved' },
+        { navKey: 'editor',      pluginId: 'editor',      slotId: 'v3-nav-editor',     anchorAfter: 'songs' },
+        { navKey: 'audio_engine', pluginId: 'audio_engine', slotId: 'v3-nav-audio-engine', anchorAfter: 'settings' },
     ];
     const TOPBAR_KEYS = ['home', 'songs', 'plugins', 'settings'];
     const SIDEBAR_GROUPS = ['HOME', 'LIBRARY'];
@@ -72,6 +83,7 @@
         tag: 'M20.6 13.4l-7.2 7.2a2 2 0 01-2.8 0l-7-7V4h9.6l7.4 7.4a2 2 0 010 2zM7.5 7.5h.01',
         amp: 'M4 5h16a1 1 0 011 1v12a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1zm11 4a3 3 0 100 6 3 3 0 000-6zM6.5 8.5h.01M9 8.5h.01',
         target: 'M12 3a9 9 0 100 18 9 9 0 000-18zm0 4a5 5 0 100 10 5 5 0 000-10zm0 4a1 1 0 100 2 1 1 0 000-2z',
+        edit: 'M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.1 2.1 0 013 3L12 15l-4 1 1-4 9.5-9.5z',
     };
     function iconSvg(name) {
         const d = ICONS[name] || ICONS.disc;
@@ -109,6 +121,19 @@
             el.classList.toggle('text-fb-textDim', !on);
         });
         setTopbarTitle(titleFor(screenId));
+        // Immersive (full-screen) plugin screens: when the active screen belongs
+        // to a plugin that opted in via `"fullscreen": true`, collapse the host
+        // chrome (topbar hidden, sidebar → icon rail; see v3.css) and let the
+        // plugin own the content area. Toggled here so it tracks every
+        // navigation, including deep-link load and programmatic showScreen().
+        const fsPluginId = (screenId && screenId.indexOf('plugin-') === 0)
+            ? screenId.slice('plugin-'.length) : null;
+        const immersive = !!(fsPluginId && FULLSCREEN_PLUGIN_IDS.has(fsPluginId));
+        document.documentElement.classList.toggle('fb-immersive', immersive);
+        // Show the song search only on the library screen. Everywhere else the
+        // box is irrelevant (and would silently no-op against v3Songs.search).
+        const searchWrap = document.getElementById('v3-search-wrap');
+        if (searchWrap) searchWrap.classList.toggle('hidden', screenId !== 'v3-songs');
         // NOTE: we deliberately do NOT reflect the screen into location.hash on
         // every navigation. app.js's audio 'error' handler suppresses empty-src
         // errors only when `audio.src === window.location.href`; a `#/...`
@@ -137,7 +162,7 @@
         return '<a href="#/' + entry.key + '" data-v3-nav="' + entry.key + '" ' +
             'class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-fb-textDim ' +
             'hover:text-fb-text hover:bg-fb-card/50 transition-colors">' +
-            iconSvg(entry.icon) + '<span class="truncate">' + esc(labelOverride != null ? labelOverride : entry.label) + '</span></a>';
+            iconSvg(entry.icon) + '<span class="truncate v3-nav-label">' + esc(labelOverride != null ? labelOverride : entry.label) + '</span></a>';
     }
     // Empty slot for a promoted plugin, anchored after a nav item. Filled by
     // renderPromotedNav() only when the plugin is installed, so an absent
@@ -154,7 +179,7 @@
             const items = NAV.filter((n) => n.group === group);
             if (!items.length) continue;
             const itemsHTML = items.map((it) => navItemHTML(it) + promotedSlotHTML(it.key)).join('');
-            html += '<div><div class="px-3 mb-1 text-[10px] uppercase tracking-wider font-semibold text-fb-textDim/70">' +
+            html += '<div><div class="v3-nav-group px-3 mb-1 text-[10px] uppercase tracking-wider font-semibold text-fb-textDim/70">' +
                 group + '</div><div class="space-y-0.5">' + itemsHTML + '</div></div>';
         }
         nav.innerHTML = html;
@@ -170,13 +195,16 @@
     function renderTopbar() {
         const bar = document.getElementById('v3-topbar');
         if (!bar) return;
-        bar.className = 'sticky top-0 z-20 bg-fb-sidebar/80 backdrop-blur';
+        bar.className = 'sticky top-0 z-30 bg-fb-sidebar/80 backdrop-blur';
         bar.innerHTML =
             // Row 1 — top utility bar: search.
             '<div class="flex items-center gap-4 px-4 md:px-8 pt-4">' +
             '<button id="v3-hamburger" class="md:hidden text-fb-textDim hover:text-fb-text shrink-0" aria-label="Menu">' +
             '<svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/></svg></button>' +
-            '<div class="flex-1 max-w-md relative">' +
+            // Search is scoped to the library — syncActive() toggles `hidden` on
+            // this wrapper so it only shows on the v3-songs screen. It lives in
+            // the sticky topbar, so it stays put while the song grid scrolls.
+            '<div id="v3-search-wrap" class="flex-1 max-w-md relative hidden">' +
             '<svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-fb-textDim" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path stroke-linecap="round" d="M21 21l-4-4"/></svg>' +
             '<input id="v3-search" type="search" placeholder="Search songs…" aria-label="Search songs" ' +
             'class="w-full bg-gray-800/50 border border-gray-700 rounded-md pl-10 pr-4 py-2 text-sm ' +
@@ -260,6 +288,12 @@
             if (res.ok) plugins = await res.json();
         } catch (e) { return; } // degrade: no promoted slots
         const list = Array.isArray(plugins) ? plugins : [];
+        // Record which installed plugins requested immersive (full-screen)
+        // screens, then re-sync the active screen so the chrome collapses even
+        // if we navigated to a fullscreen plugin before /api/plugins resolved.
+        FULLSCREEN_PLUGIN_IDS.clear();
+        for (const p of list) { if (p && p.fullscreen && p.id) FULLSCREEN_PLUGIN_IDS.add(p.id); }
+        try { syncActive(currentScreenId()); } catch (e) { /* non-fatal */ }
         for (const promo of PROMOTED_PLUGINS) {
             const host = document.getElementById(promo.slotId);
             const entry = byKey(promo.navKey);
@@ -277,7 +311,7 @@
 
     // ── showScreen wrapper (idempotent rehydration — design/05 §Rehydration) ─
     function installShowScreenHook() {
-        const hooks = window.__slopsmithV3ShellHooks || (window.__slopsmithV3ShellHooks = {});
+        const hooks = window.__feedBackV3ShellHooks || (window.__feedBackV3ShellHooks = {});
         hooks.syncActive = syncActive; // always point at the latest impl
         if (hooks.installed) return;
         hooks.installed = true;
@@ -349,8 +383,8 @@
         // The "Welcome back, {name}!" title needs the profile, which loads
         // async — refresh once it's in (and whenever it changes).
         function refreshHomeTitle() { if (currentScreenId() === 'v3-home') setTopbarTitle(titleFor('v3-home')); }
-        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
-            window.slopsmith.on('v3:profile-updated', refreshHomeTitle);
+        if (window.feedBack && typeof window.feedBack.on === 'function') {
+            window.feedBack.on('v3:profile-updated', refreshHomeTitle);
         }
         setTimeout(refreshHomeTitle, 700);
     }

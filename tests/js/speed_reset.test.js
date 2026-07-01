@@ -74,11 +74,11 @@ function buildSandbox({ juceMode = false } = {}) {
             _juceAudioUrl: juceMode ? '/audio/old-song.ogg' : null,
             _currentSongAudio: { url: '/audio/old-song.ogg' },
             _clearJuceRerouteMemo() {},
-            slopsmith: {
+            feedBack: {
                 isPlaying: true,
                 emit() {},
             },
-            slopsmithDesktop: {
+            feedBackDesktop: {
                 audio: {
                     setBackingSpeed(rate) {
                         backingCalls.push(['setBackingSpeed', rate]);
@@ -146,6 +146,9 @@ function loadPlaySong(sandbox) {
         var isPlaying = true;
         var currentFilename = null;
         var _playerOriginScreen = null;
+        var _pendingAutostart = false;
+        function _clearAutoExit() {}
+        function _resolvePlayerOrigin() { return 'home'; }
         function _recordPlaybackBridge() {}
         function _cancelCountIn() {}
         function _resetJuceAudioShimChain() {}

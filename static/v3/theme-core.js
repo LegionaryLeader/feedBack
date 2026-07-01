@@ -58,6 +58,18 @@
         // The app shell paints body via bg-fb-sidebar (covered above); cover a
         // bare body too so the radial-gradient fallback areas follow the theme.
         rules += 'html[data-fb-theme] body { background-color: rgb(var(--fbv-sidebar)); color: rgb(var(--fbv-text)); }\n';
+        // The sidebar's navy radial wash is hardcoded in v3.css (#v3-sidebar)
+        // and carries NO fb-* utility class, so the per-utility loop above
+        // can't reach it — it stayed navy under every theme, the most visible
+        // "backgrounds don't change" gap. Re-point it at the theme, mirroring
+        // v3.css's stops (#1e293b == default card, #0f172a == default bg).
+        // Only background-image is overridden, so background-attachment:fixed
+        // from v3.css is preserved. Gated by [data-fb-theme] => default look
+        // untouched. (Scroll-thumb colors are deliberately left alone: theming
+        // the resting thumb would out-specify v3.css's :hover lighten rule and
+        // kill it, and there's no palette token between border and textDim to
+        // reproduce the hover shade without color-mix, unused here.)
+        rules += 'html[data-fb-theme] #v3-sidebar { background-image: radial-gradient(circle at top, rgb(var(--fbv-card)) 0%, rgb(var(--fbv-bg)) 100%); }\n';
         return 'html[data-fb-theme] {\n' + vars + '}\n' + rules;
     }
 
@@ -104,8 +116,8 @@
             if (r.ok) {
                 const profile = await r.json();
                 applyCosmetics(profile.cosmetics);
-                if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
-                    window.slopsmith.emit('v3:cosmetics-applied', profile.cosmetics || {});
+                if (window.feedBack && typeof window.feedBack.emit === 'function') {
+                    window.feedBack.emit('v3:cosmetics-applied', profile.cosmetics || {});
                 }
             }
         } catch (e) { /* offline — keep current look */ }
@@ -122,7 +134,7 @@
     refresh();
     // Re-apply when an equip/unequip happens anywhere (shop screen, capability
     // command from a plugin).
-    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
-        window.slopsmith.on('progression:cosmetic-equipped', refresh);
+    if (window.feedBack && typeof window.feedBack.on === 'function') {
+        window.feedBack.on('progression:cosmetic-equipped', refresh);
     }
 })();

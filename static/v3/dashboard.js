@@ -9,7 +9,7 @@
  */
 (function () {
     'use strict';
-    const sm = window.slopsmith;
+    const sm = window.feedBack;
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const enc = encodeURIComponent;
@@ -58,15 +58,15 @@
         let f = ((song && song.format) || '').toLowerCase();
         if (!f) {
             const fn = ((song && song.filename) || '').toLowerCase();
-            f = fn.endsWith('.sloppak') ? 'sloppak' : '';
+            f = (fn.endsWith('.feedpak') || fn.endsWith('.sloppak')) ? 'sloppak' : '';
         }
-        return f === 'sloppak' ? 'SLOPPAK' : f === 'loose' ? 'FOLDER' : '';
+        return f === 'sloppak' ? 'FEEDPAK' : f === 'loose' ? 'FOLDER' : '';
     }
     // Corner badge for art-thumbnail cards (sloppak accented, others muted).
     function fmtBadge(song) {
         const l = fmtName(song);
         if (!l) return '';
-        const c = l === 'SLOPPAK' ? 'bg-fb-primary text-white' : 'bg-black/70 text-fb-textDim';
+        const c = l === 'FEEDPAK' ? 'bg-fb-primary text-white' : 'bg-black/70 text-fb-textDim';
         return '<span class="absolute bottom-0 left-0 ' + c + ' text-[9px] font-bold px-1.5 py-0.5 rounded-tr-md tracking-wide">' + l + '</span>';
     }
     // Inline pill for the hero (Pick/Continue) card, where the art is text-overlaid
@@ -74,7 +74,7 @@
     function fmtTag(song) {
         const l = fmtName(song);
         if (!l) return '';
-        const c = l === 'SLOPPAK' ? 'bg-fb-primary/20 text-fb-primary' : 'bg-fb-card/80 text-fb-textDim';
+        const c = l === 'FEEDPAK' ? 'bg-fb-primary/20 text-fb-primary' : 'bg-fb-card/80 text-fb-textDim';
         return '<span class="' + c + ' text-[9px] font-bold px-1.5 py-0.5 rounded tracking-wide shrink-0">' + l + '</span>';
     }
 
@@ -106,7 +106,7 @@
 
         const name = (profile && profile.display_name) || 'there';
         const ver = (version && version.version) || '';
-        const changelogUrl = ((version && version.source_url) || 'https://github.com/got-feedback/feedback') + '/blob/main/CHANGELOG.md';
+        const changelogUrl = ((version && version.source_url) || 'https://github.com/got-feedback/feedBack') + '/blob/main/CHANGELOG.md';
         const songCount = (libStats && (libStats.total_songs ?? libStats.total)) || 0;
         const pluginCount = Array.isArray(plugins)
             ? plugins.filter((p) => (p && (p.status || 'ready') === 'ready')).length : 0;
@@ -240,6 +240,10 @@
         if (window.v3AudioRouting && typeof window.v3AudioRouting.render === 'function') {
             try { window.v3AudioRouting.render(document.getElementById('v3-audio-routing')); } catch (e) { /* */ }
         }
+        // Signal that #v3-home has been (re)built, so the first-run onboarding
+        // tour can wait for the real cards instead of attaching to nodes from a
+        // prior render that this innerHTML swap just replaced.
+        try { document.dispatchEvent(new CustomEvent('v3:dashboard-rendered')); } catch (e) { /* older runtimes */ }
     }
 
     function statCard(value, unit, unitColor) {

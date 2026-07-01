@@ -1,4 +1,4 @@
-"""Tests for library filter + sort additions (slopsmith #129/#69/#128/#22).
+"""Tests for library filter + sort additions (feedBack #129/#69/#128/#22).
 
 Each filter axis is exercised independently and combined. Sort cases
 cover the new year sort and the rewritten tuning sort (now
@@ -77,7 +77,7 @@ def seeded(server_mod):
          stem_ids=["drums", "vocals"],
          tuning_name="Eb Standard", tuning_sort_key=-6)
     # Legacy row: stem_ids deliberately set to NULL via raw SQL to
-    # simulate a row that predates the slopsmith#129 migration.
+    # simulate a row that predates the feedBack#129 migration.
     server_mod.meta_db.conn.execute(
         "INSERT INTO songs (filename, mtime, size, title, artist, album, year, duration, "
         "tuning, arrangements, has_lyrics, format, stem_count, stem_ids, tuning_name, tuning_sort_key) "
@@ -275,7 +275,7 @@ def test_whitelist_rejects_unknown_arrangement(client, seeded):
     assert bogus["total"] == full["total"]
 
 
-# ── Year sort (slopsmith#128) ───────────────────────────────────────────────
+# ── Year sort (feedBack#128) ───────────────────────────────────────────────
 
 def test_year_sort_desc_newest_first(client, seeded):
     data = _get(client, sort="year-desc")
@@ -398,6 +398,39 @@ def test_query_stats_groups_non_ascii_artist_letters_under_hash(client, server_m
     assert stats["letters"] == {"#": 1}
 
 
+def test_query_stats_sort_letters_artist_counts_songs(client, server_mod):
+    """The v3 jump rail's `sort_letters` counts SONGS per first-letter bucket
+    of the active sort column (vs `letters`, which counts distinct artists).
+    Two songs by the same A-artist → letters {A:1}, sort_letters {A:2}."""
+    _put(server_mod, filename="a1.archive", title="Song One", artist="Abba")
+    _put(server_mod, filename="a2.archive", title="Song Two", artist="Abba")
+    _put(server_mod, filename="b1.archive", title="Another", artist="Beck")
+    _put(server_mod, filename="num.archive", title="Track", artist="2Pac")
+
+    # sort_letters=1 opts into the active-sort breakdown (the jump rail path).
+    stats = client.get("/api/library/stats", params={"sort": "artist", "sort_letters": 1}).json()
+    assert stats["letters"] == {"A": 1, "B": 1, "#": 1}        # distinct artists
+    assert stats["sort_letters"] == {"A": 2, "B": 1, "#": 1}   # songs
+
+    # Without the opt-in, the extra breakdown is not computed or returned.
+    plain = client.get("/api/library/stats", params={"sort": "artist"}).json()
+    assert "sort_letters" not in plain
+    assert plain["letters"] == {"A": 1, "B": 1, "#": 1}
+
+
+def test_query_stats_sort_letters_follow_title_sort(client, server_mod):
+    """With a title sort, the rail buckets key on the TITLE's first letter,
+    not the artist's, so a tap lands on a real card in the grid's order."""
+    _put(server_mod, filename="z1.archive", title="Apple", artist="Zztop")
+    _put(server_mod, filename="z2.archive", title="Banana", artist="Zztop")
+
+    stats = client.get("/api/library/stats", params={"sort": "title", "sort_letters": 1}).json()
+    assert stats["sort_letters"] == {"A": 1, "B": 1}
+    # The legacy artist breakdown is unchanged regardless of sort — both songs
+    # share one artist, so it stays a single distinct-artist Z bucket.
+    assert stats["letters"] == {"Z": 1}
+
+
 def test_query_stats_ignores_null_letter_counts(server_mod):
     """Legacy/corrupt rows can surface as NULL-ish letter aggregate
     rows on some SQLite builds. The stats endpoint should ignore those
@@ -429,9 +462,13 @@ def test_query_stats_ignores_null_letter_counts(server_mod):
     server_mod.meta_db.conn.close()
     server_mod.meta_db.conn = FakeConn()
 
-    stats = server_mod.meta_db.query_stats()
+    stats = server_mod.meta_db.query_stats(want_sort_letters=True)
 
-    assert stats == {"total_songs": 1, "total_artists": 1, "letters": {"T": 1}}
+    # `sort_letters` (the v3 jump-rail breakdown) shares the GROUP BY letter
+    # path in this fake, so it surfaces the same single live bucket when the
+    # caller opts in.
+    assert stats == {"total_songs": 1, "total_artists": 1,
+                     "letters": {"T": 1}, "sort_letters": {"T": 1}}
 
 
 def test_compound_sort_with_legacy_dir_desc_doesnt_error(client, seeded):
@@ -448,13 +485,13 @@ def test_compound_sort_with_legacy_dir_desc_doesnt_error(client, seeded):
     assert files == ["b.archive", "a.archive", "f.archive", "d.sloppak", "c.sloppak", "e.sloppak"]
 
 
-# ── Tuning sort by pitch distance (slopsmith#22) ────────────────────────────
+# ── Tuning sort by pitch distance (feedBack#22) ────────────────────────────
 
 def test_tuning_sort_by_pitch_distance(client, seeded):
     """Tuning sort previously alphabetized (Drop C, Drop D, E Standard).
     Now it's musical-distance from E Standard via ABS(sort_key) ASC,
     so E Standard (|0|) leads, then Drop D (|-2|), then Eb Standard
-    (|-6|). See slopsmith#22."""
+    (|-6|). See feedBack#22."""
     data = _get(client, sort="tuning")
     # Group by tuning name, preserving order; assert the first
     # appearance of each tuning matches the expected musical-distance
@@ -481,7 +518,7 @@ def test_tuning_names_endpoint(client, seeded):
     assert counts["Eb Standard"] == 2
 
 
-# ── Custom-tuning offsets: served + per-tuning filter (slopsmith#867) ────────
+# ── Custom-tuning offsets: served + per-tuning filter (feedBack#867) ────────
 
 def test_tuning_offsets_served_in_library_list(client, server_mod):
     """Raw offsets round-trip through the DB into the list payload so the v3

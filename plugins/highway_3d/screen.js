@@ -2,7 +2,7 @@
 // Visual layer from joel's prototype (vibrant palette, glowing strings,
 // fret heat, dynamic lane, chord frame-boxes, per-note connector labels,
 // board projection, outline+core note meshes) adapted into the
-// slopsmithViz setRenderer contract (slopsmith#36) so it works in the
+// feedBackViz setRenderer contract (feedBack#36) so it works in the
 // main player and per-panel in splitscreen without any architectural
 // changes.
 
@@ -20,6 +20,651 @@
     const THREE_URL = '/static/vendor/three/three.module.min.js';
     const THREE_CDN = 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js';
 
+    /* ── Butterchurn audio-reactive background ──────────────────────────
+     * Mounts a Butterchurn (WebGL MilkDrop) canvas BEHIND the transparent
+     * 3D highway. On desktop it's driven by the guitar/mic input (the song
+     * audio lives in JUCE, not the webview <audio>); in a browser it taps
+     * the song <audio> directly.
+     * ──────────────────────────────────────────────────────────────────── */
+    const BC_VENDOR = '/api/plugins/highway_3d/assets/vendor/';
+    const BC_FRAME = 1024;
+    const BC_WORKLET = '/api/plugins/highway_3d/assets/viz-worklet.js';
+    const _bcMeters = { gtr: 0, song: 0 }; // live levels shown in the panel readout
+    const BC_BTN = 'background:rgba(255,255,255,.09);color:#cfe3ff;border:1px solid rgba(255,255,255,.16);border-radius:5px;padding:3px 8px;cursor:pointer;font:12px system-ui';
+    let _bcLoading = null;
+    function _bcLoadLib() {
+        if (_bcLoading) return _bcLoading;
+        _bcLoading = new Promise((resolve, reject) => {
+            const add = (url, next) => {
+                const s = document.createElement('script');
+                s.src = url; s.async = true;
+                s.onload = next; s.onerror = () => reject(new Error('load ' + url));
+                document.head.appendChild(s);
+            };
+            add(BC_VENDOR + 'butterchurn.min.js', () =>
+                add(BC_VENDOR + 'butterchurnPresets.min.js', resolve));
+        });
+        // Don't cache a rejected promise: a transient load failure (network
+        // hiccup, blocked request) must not permanently disable the feature for
+        // the session. Clearing _bcLoading lets the next mount retry the load.
+        _bcLoading.catch(() => { _bcLoading = null; });
+        return _bcLoading;
+    }
+    function _bcResolve() { let b = window.butterchurn; if (b && b.default) b = b.default; return b; }
+    function _bcPresets() { let p = window.butterchurnPresets; if (p && p.default) p = p.default; return p; }
+    function _bcIsDesktop() {
+        const d = window.feedBackDesktop || window.slopsmithDesktop;
+        return !!(d && d.isDesktop && d.audio && typeof d.audio.getRawAudioFrame === 'function');
+    }
+    // Fast-forward an index to the first entry after time `ct` (used on seek/loop).
+    // Position at the first entry whose time is >= ct (strict <), so an event
+    // landing exactly on the seek/loop target time is still fired by the update
+    // walkers (which consume `<= ct`) instead of being skipped past here.
+    function _bcFfIdx(arr, ct, key) { if (!arr) return 0; let i = 0; while (i < arr.length && (arr[i][key] || 0) < ct) i++; return i; }
+    // Force-free a canvas's WebGL context so the GPU resources are released
+    // immediately instead of lingering until GC — repeated Butterchurn
+    // mount/unmount cycles otherwise pile up live contexts toward the browser cap.
+    function _bcReleaseCanvasGL(canvas) {
+        if (!canvas || typeof canvas.getContext !== 'function') return;
+        let gl = null;
+        try { gl = canvas.getContext('webgl2') || canvas.getContext('webgl'); } catch (e) { gl = null; }
+        if (!gl || typeof gl.getExtension !== 'function') return;
+        try { const lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext(); } catch (e) {}
+    }
+
+    // Desktop: bridge GUITAR input PCM + SONG output level into a Web Audio node
+    // Butterchurn can tap. Guitar gives spectral texture from your playing; the
+    // song's output meter (getLevels) injects an energy pulse so the visuals also
+    // react to the backing track (JUCE plays it — there's no song PCM to FFT).
+    function _bcGuitarFeed(actx, onReady) {
+        const latest = new Float32Array(BC_FRAME);
+        let polling = true, songLevel = 0, chartLevel = 0;
+        let node = null, sp = null, silent = null;
+        const api = (window.feedBackDesktop || window.slopsmithDesktop).audio;
+        const gainNow = () => (_bcLoadSettings().guitarGain) || 6;
+
+        // Keep the source node processing (silently — JUCE already monitors the
+        // guitar), and hand it to Butterchurn via the onReady callback.
+        function attach(srcNode) {
+            silent = actx.createGain(); silent.gain.value = 0;
+            srcNode.connect(silent); silent.connect(actx.destination);
+            try { if (onReady) onReady(srcNode); } catch (e) {}
+        }
+        // Fallback for contexts without AudioWorklet support.
+        function useScriptProcessor() {
+            let phase = 0, phase2 = 0;
+            const TWO_PI = Math.PI * 2;
+            const oscStep = TWO_PI * (90 / actx.sampleRate);
+            const oscStep2 = TWO_PI * (520 / actx.sampleRate);
+            sp = actx.createScriptProcessor(BC_FRAME, 1, 1);
+            sp.onaudioprocess = (e) => {
+                const out = e.outputBuffer.getChannelData(0);
+                const n = Math.min(out.length, latest.length);
+                const lvl = songLevel, clvl = chartLevel, gg = gainNow();
+                for (let i = 0; i < out.length; i++) {
+                    const g = (i < n ? latest[i] : 0) * gg;
+                    const song = lvl * (0.7 * Math.sin(phase) + 0.3 * (Math.random() * 2 - 1)) * 1.4;
+                    const chart = clvl * (0.5 * Math.sin(phase2) + 0.5 * (Math.random() * 2 - 1)) * 1.5;
+                    phase += oscStep; if (phase > TWO_PI) phase -= TWO_PI;
+                    phase2 += oscStep2; if (phase2 > TWO_PI) phase2 -= TWO_PI;
+                    const v = g + song + chart;
+                    out[i] = v > 1 ? 1 : (v < -1 ? -1 : v);
+                }
+            };
+            attach(sp);
+            console.log('[viz3d] audio feed: ScriptProcessor (fallback)');
+        }
+
+        // Preferred path: AudioWorklet (runs off the main thread).
+        if (actx.audioWorklet && typeof actx.audioWorklet.addModule === 'function' && typeof AudioWorkletNode === 'function') {
+            actx.audioWorklet.addModule(BC_WORKLET).then(() => {
+                if (!polling || sp) return;
+                node = new AudioWorkletNode(actx, 'viz-feed', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+                attach(node);
+                console.log('[viz3d] audio feed: AudioWorklet');
+            }).catch((e) => {
+                console.warn('[viz3d] AudioWorklet unavailable, using ScriptProcessor:', e && e.message);
+                if (polling && !sp && !node) useScriptProcessor();
+            });
+        } else {
+            useScriptProcessor();
+        }
+
+        // Guitar PCM poll → waveform + level meter (+ pushed to the worklet).
+        (function pcmLoop() {
+            if (!polling) return;
+            Promise.resolve(api.getRawAudioFrame(BC_FRAME)).then((f) => {
+                if (f && f.length) {
+                    if (f.length >= BC_FRAME) latest.set(f.subarray(0, BC_FRAME));
+                    else { latest.fill(0); latest.set(f); }
+                    let s = 0; for (let i = 0; i < BC_FRAME; i++) s += latest[i] * latest[i];
+                    _bcMeters.gtr = Math.sqrt(s / BC_FRAME) * gainNow();
+                    if (node) node.port.postMessage({ frame: latest.slice(0), song: songLevel, chart: chartLevel, gain: gainNow() });
+                }
+            }).catch(() => {}).then(() => { if (polling) setTimeout(pcmLoop, 16); });
+        })();
+        // Song output meter poll → music energy pulse.
+        (function levelLoop() {
+            if (!polling) return;
+            Promise.resolve(api.getLevels && api.getLevels()).then((L) => {
+                if (L && typeof L.outputLevel === 'number') {
+                    songLevel = Math.min(1, L.outputLevel * ((_bcLoadSettings().songGain) || 1.8));
+                    _bcMeters.song = songLevel;
+                    if (node) node.port.postMessage({ song: songLevel, chart: chartLevel, gain: gainNow() });
+                }
+            }).catch(() => {}).then(() => { if (polling) setTimeout(levelLoop, 40); });
+        })();
+
+        return {
+            setChart(v) { chartLevel = v; },
+            stop() {
+                polling = false;
+                try { if (sp) { sp.disconnect(); sp.onaudioprocess = null; } } catch (e) {}
+                try { if (node) node.disconnect(); } catch (e) {}
+                try { if (silent) silent.disconnect(); } catch (e) {}
+            }
+        };
+    }
+    // Browser audio is sourced by REUSING the highway's own shared analyser
+    // (the same #audio / stems side-chain tap the fog scenery uses), passed in
+    // as `audioProvider` to _bcCreateController. We deliberately do NOT open a
+    // second createMediaElementSource on #audio here: it can only be called
+    // once per element (a second tap throws InvalidStateError and permanently
+    // disables the other consumer), it would route the song through a fresh,
+    // possibly-suspended context and mute playback, and it would miss the stems
+    // side-chain that sloppaks expose at window.feedBack.stems.getAnalyser().
+    /* ── Controls + readability (localStorage-backed, global config) ───── */
+    const BC_LS = 'viz3d_settings';
+    const BC_DEFAULTS = { enabled: true, opacity: 1.0, laneDim: true, laneDimStrength: 0.45, chartAccents: true, colorTint: true, chartStrength: 1.0, tintStrength: 0.65, guitarGain: 6, songGain: 1.8, cyclePool: 'all', hold: false };
+    let _bcSettings = null;
+    function _bcLoadSettings() {
+        if (_bcSettings) return _bcSettings;
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(BC_LS) || '{}'); } catch (e) {}
+        _bcSettings = Object.assign({}, BC_DEFAULTS, saved);
+        return _bcSettings;
+    }
+    function _bcSaveSettings() { try { localStorage.setItem(BC_LS, JSON.stringify(_bcSettings)); } catch (e) {} }
+    const _bcControllers = new Set();
+    function _bcApplyAll() { _bcControllers.forEach((c) => { try { c.applySettings(); } catch (e) {} }); }
+    // Live-apply hook for the plugin's settings.html. The visualizer's on/off +
+    // slider controls now live in the standard settings panel (settings.html),
+    // which persists them into the BC_LS blob and then calls this so a mounted
+    // highway re-reads and applies them immediately. Defined on window at module
+    // scope so it's available regardless of whether a highway is mounted yet;
+    // settings.html guards the call with `?.` for the not-yet-loaded case.
+    window.h3dBcApplySettings = function () {
+        _bcSettings = null;        // drop the cache so the next read reloads from localStorage
+        _bcLoadSettings();
+        _bcApplyAll();
+        try { _bcUpdatePanelPreset(); } catch (e) {}
+    };
+
+    // Preset curation: favorites / bans (persisted globally) + the "primary"
+    // controller the panel's preset buttons drive.
+    // Seeded once on first run (reputation-based starter set; user can edit freely).
+    const BC_DEFAULT_FAVORITES = [
+        'Flexi, martin + geiss - dedicated to the sherwin maxawow',
+        'Geiss - Reaction Diffusion 2',
+        'Geiss - Spiral Artifact',
+        'Flexi + Martin - cascading decay swing',
+        'Flexi - mindblob [shiny mix]',
+        'Geiss - Cauldron - painterly 2 (saturation remix)',
+        'Zylot - Paint Spill (Music Reactive Paint Mix)',
+        'Flexi - predator-prey-spirals',
+        'Rovastar + Loadus + Geiss - FractalDrop (Triple Mix)',
+        'Flexi, fishbrain, Geiss + Martin - tokamak witchery',
+    ];
+    const BC_DEFAULT_BANS = [
+        'martin - mucus cervix',
+        'Goody - The Wild Vort',
+        'martin - extreme heat',
+        'Unchained - Rewop',
+        'high-altitude basket unraveling - singh grooves nitrogen argon nz+',
+        '$$$ Royal - Mashup (197)',
+        '$$$ Royal - Mashup (431)',
+        'suksma - uninitialized variabowl (hydroponic chronic)',
+        'shifter - dark tides bdrv mix 2',
+        '_Mig_049',
+    ];
+    const _bcFavorites = new Set();
+    const _bcBanned = new Set();
+    let _bcListsLoaded = false;
+    function _bcLoadLists() {
+        if (_bcListsLoaded) return; _bcListsLoaded = true;
+        try { (JSON.parse(localStorage.getItem('viz3d_favorites') || '[]') || []).forEach((n) => _bcFavorites.add(n)); } catch (e) {}
+        try { (JSON.parse(localStorage.getItem('viz3d_banned') || '[]') || []).forEach((n) => _bcBanned.add(n)); } catch (e) {}
+        let seeded = false;
+        try { seeded = !!localStorage.getItem('viz3d_seeded'); } catch (e) {}
+        if (!seeded) {
+            BC_DEFAULT_FAVORITES.forEach((n) => _bcFavorites.add(n));
+            BC_DEFAULT_BANS.forEach((n) => _bcBanned.add(n));
+            try { localStorage.setItem('viz3d_seeded', '1'); } catch (e) {}
+            _bcSaveLists();
+        }
+    }
+    function _bcSaveLists() {
+        try { localStorage.setItem('viz3d_favorites', JSON.stringify([..._bcFavorites])); } catch (e) {}
+        try { localStorage.setItem('viz3d_banned', JSON.stringify([..._bcBanned])); } catch (e) {}
+    }
+    // Re-add the bundled defaults anytime (merges; a default-fav un-bans, a default-ban un-favs).
+    function _bcRestoreDefaults() {
+        BC_DEFAULT_FAVORITES.forEach((n) => { _bcBanned.delete(n); _bcFavorites.add(n); });
+        BC_DEFAULT_BANS.forEach((n) => { _bcFavorites.delete(n); _bcBanned.add(n); });
+        try { localStorage.setItem('viz3d_seeded', '1'); } catch (e) {}
+        _bcSaveLists(); _bcUpdatePanelPreset(); _bcRenderList();
+    }
+    let _bcPrimary = null;
+    let _bcPane = null, _bcListEl = null, _bcFilterEl = null, _bcPaneOpen = false, _bcCollapsed = false;
+
+    function _bcStatusMark(name) {
+        return _bcFavorites.has(name) ? '★ ' : (_bcBanned.has(name) ? '🚫 ' : '');
+    }
+    function _bcSetHold(v) {
+        const s = _bcLoadSettings();
+        s.hold = !!v; _bcSaveSettings();
+        const b = _bcPanel && _bcPanel.querySelector('#vz-hold');
+        if (b) b.textContent = s.hold ? '▶ Resume' : '⏸ Hold';
+    }
+    // Drives both panels off the right edge. Order when both open (L→R):
+    //   visualizer panel → preset pane → window edge. Pane lives off-screen by
+    //   default; opening it shoves the panel LEFT to make room.
+    function _bcLayout() {
+        if (_bcPanel) {
+            let tx = 0;
+            if (_bcCollapsed) tx = 210;        // tuck the whole panel off the right edge
+            else if (_bcPaneOpen) tx = -248;   // slide panel LEFT to make room for the pane
+            _bcPanel.style.transform = 'translateX(' + tx + 'px) translateY(-50%)';
+        }
+        if (_bcPane) {
+            _bcPane.style.transform = (_bcPaneOpen && !_bcCollapsed) ? 'translateX(0) translateY(-50%)' : 'translateX(calc(100% + 16px)) translateY(-50%)';
+        }
+    }
+    function _bcSetPane(open) {
+        _bcPaneOpen = !!open && !_bcCollapsed;
+        const b = _bcPanel && _bcPanel.querySelector('#vz-listbtn');
+        if (b) b.textContent = _bcPaneOpen ? '>>' : '<<';
+        if (_bcPaneOpen) _bcRenderList();
+        _bcLayout();
+    }
+    function _bcRenderList() {
+        if (!_bcListEl) return;
+        const ctrl = _bcPrimary;
+        const keys = (ctrl && ctrl.keys) ? ctrl.keys : [];
+        const filt = ((_bcFilterEl && _bcFilterEl.value) || '').toLowerCase();
+        const cur = ctrl && ctrl.curName;
+        const frag = document.createDocumentFragment();
+        for (let i = 0; i < keys.length; i++) {
+            const name = keys[i];
+            if (filt && name.toLowerCase().indexOf(filt) === -1) continue;
+            const row = document.createElement('div');
+            row.textContent = _bcStatusMark(name) + name;
+            row.title = name;
+            row.style.cssText = 'padding:3px 7px;border-radius:4px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;' +
+                (name === cur ? 'background:rgba(110,160,255,.28);' : '') + (_bcBanned.has(name) ? 'opacity:.55;' : '');
+            row.addEventListener('click', () => {
+                if (!_bcPrimary) return;
+                _bcPrimary.loadByName(name, 1.0);
+                _bcSetHold(true); // picked from the list → sit on it
+            });
+            frag.appendChild(row);
+        }
+        _bcListEl.innerHTML = '';
+        _bcListEl.appendChild(frag);
+    }
+    function _bcUpdatePanelPreset() {
+        if (!_bcPanel) return;
+        const name = _bcPrimary ? (_bcPrimary.curName || null) : null;
+        const nameEl = _bcPanel.querySelector('#vz-pname');
+        const favBtn = _bcPanel.querySelector('#vz-fav');
+        const banBtn = _bcPanel.querySelector('#vz-ban');
+        const cntEl = _bcPanel.querySelector('#vz-pcount');
+        if (nameEl) { nameEl.textContent = (name ? _bcStatusMark(name) : '') + (name || '—'); nameEl.title = name ? (name + ' — click for full list') : ''; }
+        if (favBtn) favBtn.textContent = (name && _bcFavorites.has(name)) ? '★ Favorited' : '☆ Favorite';
+        if (banBtn) banBtn.textContent = (name && _bcBanned.has(name)) ? '🚫 Banned' : '🚫 Ban';
+        if (cntEl) cntEl.textContent = '★ ' + _bcFavorites.size + '   🚫 ' + _bcBanned.size;
+        if (_bcPaneOpen) _bcRenderList();
+    }
+
+    let _bcPanel = null, _bcPanelKeyBound = false;
+    function _bcEnsurePanel(host) {
+        if (_bcPanel && _bcPanel.isConnected) {
+            // Singleton panel: follow the active highway. If it's still parented
+            // to a different wrap (e.g. another mounted highway instance such as
+            // Virtuoso's embedded one), move it — and the pane — to this wrap so
+            // it appears on whichever highway is currently on-screen.
+            if (host && _bcPanel.parentNode !== host) {
+                host.appendChild(_bcPanel);
+                if (_bcPane) host.appendChild(_bcPane);
+            }
+            return _bcPanel;
+        }
+        const s = _bcLoadSettings();
+        const p = document.createElement('div');
+        p.id = 'viz3d-panel';
+        p.style.cssText = 'position:absolute;top:50%;right:10px;z-index:100000;pointer-events:auto;font:12px/1.45 system-ui,sans-serif;' +
+            'color:#cfe3ff;background:rgba(8,10,20,0.82);padding:9px 11px;border-radius:8px;width:186px;' +
+            'box-shadow:0 2px 12px rgba(0,0,0,0.5);user-select:none;transition:transform 0.28s ease;';
+        p.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px"><span style="font-weight:600">🌀 Visualizer</span><button id="vz-listbtn" title="Show / hide full preset list" style="' + BC_BTN + ';padding:1px 7px">&lt;&lt;</button></div>' +
+            // On/off + opacity/dim/chart/tint/gain controls now live in the
+            // plugin's Settings panel (settings.html). This in-canvas panel is
+            // only the LIVE preset browser (pick / favorite / ban / cycle).
+            '<div style="opacity:.55;font-size:11px;margin:2px 0 6px">Background &amp; reactivity options are in Settings ▸ 3D Highway.</div>' +
+            '<div style="display:flex;align-items:center;gap:6px;margin:4px 0">' +
+              '<button id="vz-prev" style="' + BC_BTN + '">◀</button>' +
+              '<div id="vz-pname" style="flex:1;text-align:center;font-size:11px;opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" title="">—</div>' +
+              '<button id="vz-next" style="' + BC_BTN + '">▶</button>' +
+            '</div>' +
+            '<div style="display:flex;gap:6px;margin:4px 0">' +
+              '<button id="vz-fav" style="' + BC_BTN + ';flex:1">♡ Favorite</button>' +
+              '<button id="vz-ban" style="' + BC_BTN + ';flex:1">🚫 Ban</button>' +
+            '</div>' +
+            '<div style="display:flex;gap:6px;align-items:flex-end;margin:6px 0">' +
+              '<label style="flex:1">Cycle <select id="vz-cyc" style="width:100%;background:#11141f;color:#cfe3ff;border:1px solid rgba(255,255,255,.15);border-radius:5px;padding:3px"><option value="all">All</option><option value="favorites">Favorites</option><option value="bans">Bans</option></select></label>' +
+              '<button id="vz-hold" style="' + BC_BTN + '">⏸ Hold</button>' +
+            '</div>' +
+            '<div style="margin:5px 0 4px;font-size:11px;opacity:.75"><span id="vz-pcount">★ 0   🚫 0</span></div>' +
+            '<div id="vz-meter" style="opacity:.65;margin-top:6px;font:11px/1.3 monospace">gtr —  ·  song —</div>' +
+            '<div style="opacity:.45;margin-top:4px;font-size:11px">` or ‹‹ to hide</div>';
+        (host || document.body).appendChild(p);
+
+        // Slide handle (<< / >>) so the panel can tuck off the right edge and stop
+        // covering the Now / Up-Next labels.
+        const tab = document.createElement('button');
+        tab.textContent = '>>';
+        tab.title = 'Hide / show controls';
+        tab.style.cssText = 'position:absolute;top:6px;left:-23px;width:23px;height:28px;border:none;cursor:pointer;' +
+            'background:rgba(8,10,20,0.82);color:#cfe3ff;border-radius:7px 0 0 7px;font:12px/1 monospace;padding:0;';
+        p.appendChild(tab);
+        tab.addEventListener('click', () => {
+            _bcCollapsed = !_bcCollapsed;
+            if (_bcCollapsed) _bcPaneOpen = false; // collapsing the panel hides the pane too
+            tab.textContent = _bcCollapsed ? '<<' : '>>';
+            const lb = p.querySelector('#vz-listbtn'); if (lb) lb.textContent = _bcPaneOpen ? '>>' : '<<';
+            _bcLayout();
+        });
+
+        // Sliding preset-list pane (sits to the LEFT of the control panel)
+        const pane = document.createElement('div');
+        pane.id = 'viz3d-listpane';
+        pane.style.cssText = 'position:absolute;top:50%;right:10px;z-index:99999;pointer-events:auto;width:236px;max-height:74vh;display:flex;flex-direction:column;' +
+            'background:rgba(8,10,20,0.93);border-radius:8px;box-shadow:0 2px 14px rgba(0,0,0,0.55);color:#cfe3ff;' +
+            'font:12px system-ui,sans-serif;overflow:hidden;transform:translateX(calc(100% + 16px)) translateY(-50%);transition:transform 0.28s ease;';
+        pane.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 9px 7px 10px;font-weight:600;border-bottom:1px solid rgba(255,255,255,.1)"><span>Presets</span><button id="vz-defaults" title="Restore the bundled default favorites + bans" style="' + BC_BTN + ';font-weight:400">↺ defaults</button></div>' +
+            '<input id="vz-filter" placeholder="filter…" spellcheck="false" style="margin:8px 9px 6px;padding:4px 7px;background:#11141f;color:#cfe3ff;border:1px solid rgba(255,255,255,.15);border-radius:5px;outline:none">' +
+            '<div id="vz-list" style="overflow-y:auto;padding:0 4px 8px"></div>';
+        (host || document.body).appendChild(pane);
+        _bcPane = pane;
+        _bcListEl = pane.querySelector('#vz-list');
+        _bcFilterEl = pane.querySelector('#vz-filter');
+        _bcFilterEl.addEventListener('input', _bcRenderList);
+        pane.querySelector('#vz-defaults').addEventListener('click', _bcRestoreDefaults);
+
+        const q = (id) => p.querySelector(id);
+        _bcPanel = p;
+
+        // Preset curation wiring (favorites / bans / cycle / reset)
+        _bcLoadLists();
+        const cyc = q('#vz-cyc');
+        cyc.value = s.cyclePool || 'all';
+        // Read fresh: settings.html writes can replace _bcSettings, so the `s`
+        // captured at panel creation may be stale by the time this fires.
+        cyc.addEventListener('change', () => { _bcLoadSettings().cyclePool = cyc.value; _bcSaveSettings(); });
+        _bcSetHold(!!s.hold); // sync the Hold button label to the saved state
+        q('#vz-hold').addEventListener('click', () => _bcSetHold(!_bcLoadSettings().hold));
+        q('#vz-listbtn').addEventListener('click', () => _bcSetPane(!_bcPaneOpen));
+        q('#vz-pname').addEventListener('click', () => _bcSetPane(!_bcPaneOpen));
+        q('#vz-prev').addEventListener('click', () => { if (_bcPrimary) _bcPrimary.step(-1); });
+        q('#vz-next').addEventListener('click', () => { if (_bcPrimary) _bcPrimary.step(1); });
+        q('#vz-fav').addEventListener('click', () => { if (_bcPrimary) _bcPrimary.toggleFav(); });
+        q('#vz-ban').addEventListener('click', () => { if (_bcPrimary) _bcPrimary.banCur(); });
+        _bcSetPane(false); // start collapsed; sets the list-button label
+        _bcUpdatePanelPreset();
+
+        // Live level readout — proves the song (not just guitar) is driving things.
+        // Self-stops when the panel is removed (_bcPanel !== p).
+        (function meterLoop() {
+            if (_bcPanel !== p) return;
+            const m = p.querySelector('#vz-meter');
+            if (m) m.textContent = 'gtr ' + _bcMeters.gtr.toFixed(2) + '  ·  song ' + _bcMeters.song.toFixed(2);
+            setTimeout(meterLoop, 150);
+        })();
+
+        if (!_bcPanelKeyBound) {
+            _bcPanelKeyBound = true;
+            window.addEventListener('keydown', (e) => {
+                if (e.key !== '`' || e.metaKey || e.ctrlKey || !_bcPanel) return;
+                const tag = (e.target && e.target.tagName) || '';
+                if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+                const reveal = _bcPanel.style.display === 'none';
+                _bcPanel.style.display = reveal ? '' : 'none';
+                if (_bcPane) _bcPane.style.display = reveal ? '' : 'none';
+            });
+        }
+        return _bcPanel;
+    }
+
+    // Create a Butterchurn background controller bound to a wrap element.
+    function _bcCreateController(wrap, sizeProvider, audioProvider) {
+        const ctrl = { viz: null, actx: null, guitar: null, map: null, keys: [], cycle: 0, dead: false, lastW: -1, lastH: -1, canvas: null, backdrop: null, scrim: null, tint: null, wrap: wrap };
+        // Layered DOM in the wrap, all BEHIND the transparent 3D highway:
+        //   backdrop(z-4 dark) → bc canvas(z-3) → tint(z-2 instrument color) → scrim(z-1 lane dim)
+        const mkLayer = (cls, css) => { const d = document.createElement('div'); d.className = cls; d.style.cssText = css; wrap.appendChild(d); return d; };
+        const backdrop = mkLayer('viz3d-backdrop', 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:-4;background:#070710;pointer-events:none;');
+        const canvas = document.createElement('canvas');
+        canvas.className = 'viz3d-bc';
+        canvas.style.cssText = 'position:absolute;top:0;left:0;z-index:-3;pointer-events:none;';
+        wrap.appendChild(canvas);
+        const tint = mkLayer('viz3d-tint', 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:-2;pointer-events:none;mix-blend-mode:overlay;background:transparent;');
+        const scrim = mkLayer('viz3d-scrim', 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;pointer-events:none;');
+        ctrl.canvas = canvas; ctrl.backdrop = backdrop; ctrl.scrim = scrim; ctrl.tint = tint;
+
+        ctrl.applySettings = function () {
+            const s = _bcLoadSettings();
+            canvas.style.display = s.enabled ? '' : 'none';
+            canvas.style.opacity = String(s.enabled ? s.opacity : 0);
+            if (s.laneDim) {
+                const a = Math.max(0, Math.min(1, s.laneDimStrength)).toFixed(3);
+                scrim.style.display = '';
+                scrim.style.background = 'linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,' + a +
+                    ') 30%, rgba(0,0,0,' + a + ') 70%, rgba(0,0,0,0) 100%)';
+            } else {
+                scrim.style.display = 'none';
+            }
+        };
+
+        // ── Preset curation (favorites / bans / cycle mode) ──
+        ctrl.curName = null; ctrl.lastManual = 0;
+        ctrl.allList = () => (ctrl.keys || []).filter((k) => !_bcBanned.has(k));
+        ctrl.pool = () => {
+            const mode = _bcLoadSettings().cyclePool || 'all';
+            if (mode === 'bans') return (ctrl.keys || []).filter((k) => _bcBanned.has(k));
+            if (mode === 'favorites') {
+                const f = (ctrl.keys || []).filter((k) => _bcFavorites.has(k) && !_bcBanned.has(k));
+                if (f.length) return f;
+            }
+            return ctrl.allList();
+        };
+        ctrl.browseArr = () => ctrl.keys || []; // ◀▶ and the list pane walk the full preset list
+        ctrl.loadByName = (name, blend) => {
+            if (!ctrl.viz || !name || !ctrl.map || !ctrl.map[name]) return;
+            try { ctrl.viz.loadPreset(ctrl.map[name], blend || 0); ctrl.curName = name; } catch (e) {}
+            _bcUpdatePanelPreset();
+        };
+        ctrl.autoTick = () => {
+            if (ctrl.dead || _bcLoadSettings().hold) return;
+            if (performance.now() - ctrl.lastManual < 8000) return;
+            const pool = ctrl.pool();
+            if (!pool.length) return;
+            let name = pool[(Math.random() * pool.length) | 0];
+            if (pool.length > 1 && name === ctrl.curName) name = pool[(pool.indexOf(name) + 1) % pool.length];
+            ctrl.loadByName(name, 2.7);
+        };
+        ctrl.step = (dir) => {
+            const list = ctrl.browseArr();
+            if (!list.length) return;
+            let i = list.indexOf(ctrl.curName); if (i < 0) i = (dir > 0 ? -1 : 0);
+            i = (i + dir + list.length) % list.length;
+            ctrl.lastManual = performance.now();
+            ctrl.loadByName(list[i], 1.5);
+        };
+        ctrl.toggleFav = () => {
+            if (!ctrl.curName) return;
+            if (_bcFavorites.has(ctrl.curName)) _bcFavorites.delete(ctrl.curName);
+            else { _bcFavorites.add(ctrl.curName); _bcBanned.delete(ctrl.curName); }
+            _bcSaveLists(); _bcUpdatePanelPreset();
+        };
+        ctrl.banCur = () => {
+            if (!ctrl.curName) return;
+            if (_bcBanned.has(ctrl.curName)) {           // un-ban (two-way) — stay on it
+                _bcBanned.delete(ctrl.curName);
+                _bcSaveLists(); _bcUpdatePanelPreset();
+            } else {                                     // ban + advance off it
+                _bcBanned.add(ctrl.curName); _bcFavorites.delete(ctrl.curName);
+                _bcSaveLists(); ctrl.step(1);
+            }
+        };
+        _bcPrimary = ctrl;
+
+        _bcControllers.add(ctrl);
+        _bcEnsurePanel(wrap);
+        ctrl.applySettings();
+
+        _bcLoadLib().then(() => {
+            if (ctrl.dead) return;
+            const bc = _bcResolve();
+            if (!bc || typeof bc.createVisualizer !== 'function') { console.warn('[viz3d] Butterchurn global missing'); return; }
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            const sz = (sizeProvider && sizeProvider()) || { w: 1280, h: 720 };
+            // Browser (Docker/web app): REUSE the highway's existing shared
+            // analyser (the fog scenery's #audio / stems tap) via audioProvider,
+            // and build Butterchurn on that SAME AudioContext so connectAudio()
+            // doesn't fail cross-context. Desktop uses its own context fed by the
+            // guitar/mic input. `ownsActx` tracks whether WE created the context
+            // (so destroy() closes only contexts we own, never the shared one).
+            const fogAudio = _bcIsDesktop() ? null : (audioProvider ? audioProvider() : null);
+            ctrl.ownsActx = !(fogAudio && fogAudio.ctx);
+            ctrl.actx = (fogAudio && fogAudio.ctx) || new Ctx();
+            if (ctrl.actx.state === 'suspended' && ctrl.actx.resume) ctrl.actx.resume().catch(() => {});
+            ctrl.viz = bc.createVisualizer(ctrl.actx, canvas, {
+                width: sz.w || 1280, height: sz.h || 720,
+                pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5), textureRatio: 1,
+            });
+            if (_bcIsDesktop()) {
+                try {
+                    ctrl.guitar = _bcGuitarFeed(ctrl.actx, (srcNode) => { try { if (ctrl.viz) ctrl.viz.connectAudio(srcNode); } catch (e) {} });
+                    console.log('[viz3d] bg: feeding GUITAR input into Butterchurn');
+                } catch (e) { console.warn('[viz3d] guitar feed failed', e); }
+            } else if (fogAudio && fogAudio.analyser) {
+                // The shared AnalyserNode is a passthrough — connecting it onward
+                // to Butterchurn's internal analyser doesn't disturb the fog's reads.
+                try { ctrl.viz.connectAudio(fogAudio.analyser); console.log('[viz3d] browser: Butterchurn tapping shared analyser (' + (fogAudio.source || 'core') + ')'); }
+                catch (e) { console.warn('[viz3d] shared-analyser connect failed', e); }
+            }
+            _bcLoadLists();
+            const presets = _bcPresets();
+            if (presets && typeof presets.getPresets === 'function') { ctrl.map = presets.getPresets(); ctrl.keys = Object.keys(ctrl.map); }
+            const pool0 = ctrl.pool();
+            ctrl.loadByName(pool0.length ? pool0[(Math.random() * pool0.length) | 0] : (ctrl.keys[0] || null), 0.0);
+            ctrl.cycle = setInterval(() => ctrl.autoTick(), 30000);
+            ctrl.connectedAnalyser = (fogAudio && fogAudio.analyser) || null;
+            console.log('[viz3d] Butterchurn ready, presets:', ctrl.keys.length);
+        }).catch((e) => {
+            // Async init failed (lib load, WebGL/context creation, etc.). Clean up
+            // the half-mounted controller so we don't leak an owned AudioContext /
+            // DOM layers, and mark it dead so _bcSyncMode can retry on a later
+            // mount instead of seeing a live-looking but non-functional bcCtrl.
+            console.error('[viz3d] Butterchurn load/init failed', e);
+            try { _bcReleaseCanvasGL(ctrl.canvas); } catch (_) {}
+            try { if (ctrl.guitar) { ctrl.guitar.stop(); ctrl.guitar = null; } } catch (_) {}
+            try { [ctrl.canvas, ctrl.backdrop, ctrl.scrim, ctrl.tint].forEach((el) => { if (el && el.parentNode) el.parentNode.removeChild(el); }); } catch (_) {}
+            if (ctrl.ownsActx && ctrl.actx && typeof ctrl.actx.close === 'function') { try { ctrl.actx.close(); } catch (_) {} }
+            ctrl.actx = null; ctrl.viz = null; ctrl.dead = true;
+            _bcControllers.delete(ctrl);
+        });
+        return {
+            applySettings() { ctrl.applySettings(); },
+            dead() { return ctrl.dead; },
+            ready() { return !!ctrl.viz; },
+            boundAnalyser() { return ctrl.connectedAnalyser || null; },
+            audioCtx() { return ctrl.actx; },
+            // Re-bind audio when the shared analyser changes (e.g. a stems song
+            // swap replaces the analyser). Same context → cheap reconnect; the
+            // caller handles a context change with a full rebuild (cross-context
+            // connectAudio is impossible — the visualizer is bound to one ctx).
+            reconnectAudio(a) {
+                if (!a || !a.analyser || !ctrl.viz) return false;
+                if (a.analyser === ctrl.connectedAnalyser) return true;
+                if (a.ctx && a.ctx !== ctrl.actx) return false; // needs rebuild
+                try { ctrl.viz.connectAudio(a.analyser); ctrl.connectedAnalyser = a.analyser; return true; } catch (e) { return false; }
+            },
+            chart(v) { if (ctrl.guitar && ctrl.guitar.setChart) ctrl.guitar.setChart(v); },
+            tint(hex, alpha) {
+                if (!ctrl.tint) return;
+                if (hex == null) { ctrl.tint.style.background = 'transparent'; return; }
+                const r = (hex >> 16) & 255, g = (hex >> 8) & 255, b = hex & 255;
+                ctrl.tint.style.background = 'rgba(' + r + ',' + g + ',' + b + ',' + (alpha || 0).toFixed(3) + ')';
+            },
+            render() {
+                const s = _bcLoadSettings();
+                if (!ctrl.viz || !s.enabled) return; // skip GPU work when the bg is off
+                const sz = sizeProvider && sizeProvider();
+                if (sz && sz.w > 0 && sz.h > 0 && (sz.w !== ctrl.lastW || sz.h !== ctrl.lastH)) {
+                    ctrl.lastW = sz.w; ctrl.lastH = sz.h;
+                    const wpx = sz.w + 'px', hpx = sz.h + 'px';
+                    // Confine ALL layers to exactly the highway-canvas rect so the opaque
+                    // backdrop can't bleed over the transport bar above the highway.
+                    [ctrl.canvas, ctrl.backdrop, ctrl.scrim, ctrl.tint].forEach((el) => {
+                        if (el) { el.style.width = wpx; el.style.height = hpx; el.style.right = 'auto'; el.style.bottom = 'auto'; }
+                    });
+                    try { ctrl.viz.setRendererSize(sz.w, sz.h); } catch (e) {}
+                }
+                try { ctrl.viz.render(); } catch (e) {}
+            },
+            resize(w, h) { if (ctrl.viz && ctrl.viz.setRendererSize) { try { ctrl.viz.setRendererSize(w, h); } catch (e) {} ctrl.lastW = w; ctrl.lastH = h; } },
+            destroy() {
+                ctrl.dead = true;
+                _bcControllers.delete(ctrl);
+                if (_bcPrimary === ctrl) { _bcPrimary = _bcControllers.values().next().value || null; _bcUpdatePanelPreset(); }
+                if (ctrl.cycle) { clearInterval(ctrl.cycle); ctrl.cycle = 0; }
+                if (ctrl.guitar) { ctrl.guitar.stop(); ctrl.guitar = null; }
+                // Release the Butterchurn WebGL context deterministically (don't
+                // wait for GC) so repeated mounts/toggles can't exhaust the
+                // browser's WebGL context cap (~16). Do it before removing the
+                // canvas from the DOM.
+                _bcReleaseCanvasGL(ctrl.canvas);
+                [ctrl.canvas, ctrl.backdrop, ctrl.scrim, ctrl.tint].forEach((el) => { if (el && el.parentNode) el.parentNode.removeChild(el); });
+                ctrl.viz = null; ctrl.connectedAnalyser = null;
+                // Close the AudioContext only if we own it (desktop, or the
+                // browser fallback). The browser path normally reuses the
+                // highway's shared context, which the fog system owns — never
+                // close that. Without this, desktop leaks a new AudioContext per
+                // mount and hits the browser's ~6-context cap after a few toggles.
+                if (ctrl.ownsActx && ctrl.actx && typeof ctrl.actx.close === 'function') {
+                    try { ctrl.actx.close(); } catch (e) {}
+                }
+                ctrl.actx = null;
+                if (_bcControllers.size === 0) {
+                    if (_bcPanel && _bcPanel.parentNode) _bcPanel.parentNode.removeChild(_bcPanel);
+                    if (_bcPane && _bcPane.parentNode) _bcPane.parentNode.removeChild(_bcPane);
+                    _bcPanel = null; _bcPane = null; _bcListEl = null; _bcFilterEl = null; _bcPaneOpen = false;
+                } else if (_bcPrimary && _bcPrimary.wrap) {
+                    // Splitscreen: a controller other than this one is still
+                    // alive. The singleton panel was parented to THIS (now
+                    // destroyed) wrap, so re-home it onto the surviving primary's
+                    // wrap — otherwise the panel is orphaned on the dead wrap and
+                    // the surviving highway is left with no visualizer controls
+                    // (_bcEnsurePanel only runs at controller creation). It moves
+                    // the existing panel+pane when connected, or rebuilds them on
+                    // the survivor if this wrap was already detached.
+                    try { _bcEnsurePanel(_bcPrimary.wrap); _bcUpdatePanelPreset(); } catch (e) {}
+                }
+            },
+        };
+    }
+
     // Selectable per-string color palettes (issue #10). Each palette has
     // 8 entries to match MAX_RENDER_STRINGS so 6/7/8-string arrangements
     // all index safely. Default is the canonical chart-format classic
@@ -27,12 +672,12 @@
     // high E=purple); Neon pushes saturation harder; Pastel desaturates
     // for long-session comfort; Colorblind (high contrast) is derived from
     // the chart format's built-in colorblind-mode palette, but this preset
-    // intentionally keeps some entries tuned for slopsmith rather than
+    // intentionally keeps some entries tuned for feedBack rather than
     // reproducing every original hex value verbatim. The chart-format base
     // values came from community reverse-engineering of the original chart
     // files; do not treat the tuned values below as the exact original
     // palette.
-    // In slopsmith's index convention s=0 is the low E (thickest) and
+    // In feedBack's index convention s=0 is the low E (thickest) and
     // s=5 is the high E (thinnest), matching the chart format's native string
     // indexing. Per-index ordering is preserved across all palettes so
     // switching between them never reassigns a string to a different
@@ -128,10 +773,10 @@
     const MAX_RENDER_STRINGS = S_COL.length;
 
     // Resolve the string count for the active arrangement. Prefer
-    // bundle.stringCount (exposed by slopsmith core since #93 — derived
+    // bundle.stringCount (exposed by feedBack core since #93 — derived
     // from notes/chords/tuning, so it works for 5-string bass, 7- and
     // 8-string guitar, etc.). Fall back to arrangement-name detection
-    // for older slopsmith cores that don't emit the field. Clamp to the
+    // for older feedBack cores that don't emit the field. Clamp to the
     // palette size so a malformed bundle or a 12-string chart doesn't
     // index past the per-string material arrays.
     function resolveStringCount(bundle) {
@@ -231,7 +876,7 @@
     const AHEAD = 3.0;
     const BEHIND = 0.5;
     // How long a note/chord-frame stays renderable past the hit line while a
-    // note-state provider (slopsmith#254) is attached. The provider's
+    // note-state provider (feedBack#254) is attached. The provider's
     // hit/miss verdict is asynchronous — the engine-side verifier reports it
     // ~0.35-0.5 s after the line — so the default ~50 ms note linger /
     // ~0.48 s chord linger lapses before the tint can apply. Drives both
@@ -438,6 +1083,22 @@
     const FOCUS_D = 600 * K;
     const CAM_LERP_BASE = 0.02;
 
+    // Base vertical field of view (deg). THREE's PerspectiveCamera fov is the
+    // VERTICAL angle; horizontal follows from the aspect ratio. At a normal
+    // ~16:9 pane this gives a ~102° horizontal cone. On an ultra-wide pane
+    // (top/bottom 2-player split → full-width/half-height → ~32:9) that
+    // horizontal cone balloons past 130° and squeezes the fixed-width neck into
+    // a central sliver. The optional horizontal-FOV-hold path below counters
+    // that by lowering the effective vertical fov as the pane widens.
+    const BASE_VFOV = 70;
+    // Horizontal-FOV-hold ("Hor+") defaults. At/under HORPLUS_START_ASPECT the
+    // effective vertical fov equals BASE_VFOV (exact no-op); past it the
+    // vertical fov drops to keep the horizontal cone ~constant so the neck
+    // fills a wide pane. HORPLUS_MIN_VFOV floors the result on pathological
+    // aspects. Engaged only via the window.__h3dAspectTune bridge (default off).
+    const HORPLUS_START_ASPECT = 16 / 9;
+    const HORPLUS_MIN_VFOV = 28;
+
     // Zoom-dependent framing — height (h*) and depth (dist*) multipliers
     // applied to cam.position. Interpolated by `dist`:
     //   NEAR = tight view (nut position, span<=4 -> dist~=93*K): lower/closer.
@@ -450,6 +1111,16 @@
     const CAM_FRAME_H_FAR  = 1.00;
     const CAM_FRAME_D_NEAR = 0.575;
     const CAM_FRAME_D_FAR  = 0.60;
+    // Fret-row fit guard. The heat-coloured fret-number row is a band drawn
+    // BELOW the board (at sY(lowest) - S_GAP*1.4). The lower-third framing
+    // anchors the board CENTRE, not that row, so a tight zoom on a centred span
+    // (worst mid-neck — fine pushed to either end of the neck) drops the row off
+    // the bottom edge. Tilt can't add vertical room there (it would only trade a
+    // bottom clip for a top clip), so camUpdate dollies the camera back just
+    // enough to bring the row back into frame — auto-sized, capped, hysteretic.
+    const FRET_ROW_FIT_NDC_MIN   = -0.86;  // keep the row anchor at/above this NDC y (>-1 = on screen)
+    const FRET_ROW_FIT_DEADBAND  = 0.06;   // headroom past the min before the dolly relaxes (anti-hunt)
+    const FRET_ROW_FIT_BOOST_MAX = 1.6;    // cap the pull-back so the zoom can't pop (never dolly back > +60%)
 
     // Camera-X targeting (issue #34). The visible AHEAD = 4.0 s window is
     // far too coarse for picking where the camera should sit — a single
@@ -664,7 +1335,7 @@
     /** Arpeggio rim accent and lane tint. */
     const ARPEGGIO_RIM_BLUE_HEX = 0x454BB6;
     /** Post-hit chord-frame rim tints driven by the note-state provider
-     *  (slopsmith#254). Applied only to the teal frame during the linger
+     *  (feedBack#254). Applied only to the teal frame during the linger
      *  fade (chDt <= 0) when a scorer is attached.
      *  Matches the gem hit/miss colours so chord frame and note body
      *  give a consistent signal:
@@ -754,7 +1425,16 @@
             if (localStorage.getItem('highway_3d.fretSpacing') === m) return;
             localStorage.setItem('highway_3d.fretSpacing', m);
         } catch (_) {}
-        location.reload();
+        // Apply live rather than reloading the page — a full page reload
+        // reboots the SPA to the home screen (index.html's `.screen.active`),
+        // ejecting the user from Settings. Rebind the module-scope flag so
+        // panels mounted later this session pick up the new mode, recompute
+        // the fretX-derived scalars, then broadcast a change so every mounted
+        // panel rebuilds its board. Same live-update path as every other
+        // 3D-highway setting.
+        _h3dFretUniform = (m !== 'logarithmic');
+        _recomputeFretSpacingDerived();
+        _bgEmitChange('fretSpacing');
     };
 
     const fretMid = f => (f <= 0 ? -2 * K : (fretX(f - 1) + fretX(f)) / 2);
@@ -767,7 +1447,10 @@
     }
     /** Reference column (~mid board): prior fixed K-based sprites matched this neighborhood. */
     const FRET_LABEL_SCALE_REF_FRET = 5;
-    const _fretLabelScaleRefW = Math.max(1e-8, fretColumnWorldW(FRET_LABEL_SCALE_REF_FRET));
+    // `let` (not `const`): recomputed by _recomputeFretSpacingDerived when the
+    // user flips Uniform/Logarithmic at runtime so label scaling tracks the
+    // new geometry without a page reload.
+    let _fretLabelScaleRefW = Math.max(1e-8, fretColumnWorldW(FRET_LABEL_SCALE_REF_FRET));
     function fretLabelScaleForFret(f) {
         const w = fretColumnWorldW(f);
         const m = w / _fretLabelScaleRefW;
@@ -823,7 +1506,19 @@
     // World-units-per-fret near mid-neck. Used by the camera-X hysteresis
     // gate (issue #34) to convert a fret-equivalent dead zone into world
     // units. Pure function of SCALE — hoist out of update()'s hot path.
-    const FRET_WIDTH_MID = fretX(7) - fretX(6);
+    // `let` (not `const`): recomputed alongside _fretLabelScaleRefW when the
+    // fret-spacing mode flips at runtime — see _recomputeFretSpacingDerived.
+    let FRET_WIDTH_MID = fretX(7) - fretX(6);
+
+    // Recompute the fretX-derived scalars baked at module init. Called from
+    // h3dSetFretSpacing after _h3dFretUniform flips so label scaling and the
+    // camera hysteresis threshold track the newly chosen spacing — the live
+    // alternative to the old location.reload(), which ejected the user from
+    // Settings back to the home screen.
+    function _recomputeFretSpacingDerived() {
+        _fretLabelScaleRefW = Math.max(1e-8, fretColumnWorldW(FRET_LABEL_SCALE_REF_FRET));
+        FRET_WIDTH_MID = fretX(7) - fretX(6);
+    }
 
     function computeBPM(beats, t) {
         if (!beats || beats.length < 2) return 120;
@@ -898,7 +1593,7 @@
      * ====================================================================== */
 
     function _ssActive() {
-        const ss = window.slopsmithSplitscreen;
+        const ss = window.feedBackSplitscreen;
         if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
         return typeof ss.isCanvasFocused === 'function'
             && typeof ss.onFocusChange === 'function'
@@ -906,10 +1601,482 @@
     }
 
     function _ssIsCanvasFocused(highwayCanvas) {
-        const ss = window.slopsmithSplitscreen;
+        const ss = window.feedBackSplitscreen;
         if (!_ssActive()) return true;
         return !!(ss && typeof ss.isCanvasFocused === 'function' &&
             ss.isCanvasFocused(highwayCanvas));
+    }
+
+    // Shortcut for the wide-pane framing tuner. Opens/closes the floating panel
+    // (the A/B on/off and the per-pane target live inside it now). Registered
+    // once per session via a module-level guard (it drives shared module state,
+    // so per-instance registration would stack duplicate handlers and cancel
+    // itself out); it's a harmless debug control, so it is never unregistered.
+    // No-ops where the core shortcut API isn't present (older core / borrowed
+    // contexts).
+    let _tunerShortcutRegistered = false;
+    function _registerTunerShortcut() {
+        if (_tunerShortcutRegistered) return;
+        if (typeof window.registerShortcut !== 'function') return;
+        _tunerShortcutRegistered = true;
+        try {
+            window.registerShortcut({
+                key: 'A',   // uppercase e.key → produced with Shift held (Shift+A)
+                description: '3D Highway: open/close wide-pane framing tuner (Shift+A)',
+                scope: 'player',
+                handler: () => {
+                    // Open/close the live tuner panel. The A/B on/off and the
+                    // per-pane target now live in the panel itself, so the
+                    // shortcut is just a dismiss/reveal.
+                    _toggleAspectPanel();
+                },
+            });
+        } catch (e) {
+            _tunerShortcutRegistered = false;   // allow a later retry if it threw
+        }
+    }
+
+    // ── Wide-pane framing: live tuner bridge + panel ──────────────────────────
+    // window.__h3dAspectTune is the single source of truth the renderer reads
+    // each frame (see effectiveVfov + camUpdate). The defaults reproduce the
+    // current framing exactly (enabled:false). Values persist to localStorage so
+    // a tuning session survives reloads; the floating panel (Shift+A) writes the
+    // same object live. All of this is a debug aid — none of it runs unless the
+    // user opts in.
+    // Versioned key: the first iteration shipped a broken default (enabled:true,
+    // baseVfov:30) and may have persisted it. Bumping the key ignores that stale
+    // state so the corrected default-off config actually takes effect.
+    const _ASPECT_LS = 'h3d_aspect_tune2';
+    // Working defaults. Default OFF, so out of the box this is an exact no-op —
+    // every pane renders byte-for-byte as before (effectiveVfov returns
+    // BASE_VFOV and the pose nudges gate off). The config is also coherent when
+    // a tester turns it ON via Shift+A: baseVfov == BASE_VFOV so normal ~16:9
+    // panes (single-player, most 2x2) stay at 70° even enabled, and only panes
+    // wider than startAspect (2.25) engage the Hor+ hold; blend:1 makes that
+    // hold actually take effect; minVfovDeg (28) sits below baseVfov so the floor
+    // is a real floor. The pose nudges are the in-progress wide-pane look a
+    // tester sees once enabled. localStorage overrides all of this per machine.
+    const _ASPECT_DEFAULTS = {
+        enabled: false, baseVfov: BASE_VFOV, startAspect: 2.25, hfovDeg: null,
+        blend: 1, minVfovDeg: HORPLUS_MIN_VFOV, splitOnly: false,
+        heightMul: 0.30, distMul: 0.95, pitchAdd: -1.5, lookDepthMul: 1,
+    };
+    // Slider specs (numeric fields). Checkboxes (enabled/splitOnly) + the hfov
+    // override are handled separately in the panel builder. Ranges are wide on
+    // purpose — this is a tuning aid, the no-op default sits mid-range.
+    const _ASPECT_FIELDS = [
+        { k: 'baseVfov',     label: 'Base vFOV°',   min: 18,  max: 90,  step: 1 },
+        { k: 'startAspect',  label: 'Start aspect', min: 1.0, max: 4.0, step: 0.05 },
+        { k: 'blend',        label: 'Blend',        min: 0,   max: 1,   step: 0.05 },
+        { k: 'minVfovDeg',   label: 'Min vFOV°',    min: 10,  max: 60,  step: 1 },
+        { k: 'heightMul',    label: 'Height ×',     min: 0.1, max: 2.5, step: 0.05 },
+        { k: 'distMul',      label: 'Dolly ×',      min: 0.2, max: 3.0, step: 0.05 },
+        { k: 'pitchAdd',     label: 'Pitch +',      min: -40, max: 40,  step: 0.5 },
+        // Aims the camera further down the neck (>1) or pulls the aim back (<1).
+        // This is the lever that flattens the mid-distance "hump" toward a
+        // straight gradual recede.
+        { k: 'lookDepthMul', label: 'Look depth',   min: 0.2, max: 3.0, step: 0.05 },
+    ];
+    let _aspectPanelEl = null;        // the floating panel root (built once)
+    let _aspectPanelRO = null;        // readout <div>
+    let _aspectPanelRAF = 0;          // readout poll handle
+    let _aspectTargetSel = null;      // the "Target" <select>
+    let _aspectTgtRow = null;         // the Target row (hidden when only one pane)
+    let _aspectHfovCb = null;         // hfov-override checkbox (synced explicitly)
+    let _aspectHfovSl = null;         // hfov-override slider
+    // Which pane the panel edits. '' = all panes (writes the shared base object);
+    // a pane key ('arr:<name>' or the fallback 'pane:<uid>') writes that pane's
+    // sparse override, so one split pane can be framed independently.
+    let _aspectEditTarget = '';
+    // Bumped when the SET of live panes changes (add/prune) so the panel rebuilds
+    // the Target dropdown — never on a per-frame label re-report, which would
+    // flicker the <select>.
+    let _aspectPanesDirty = true;
+    // Monotonic counter for the per-instance fallback key (when a pane has no
+    // arrangement name to key by).
+    let _aspectPaneCounter = 0;
+    function _aspectNowMs() {
+        try { if (performance && performance.now) return performance.now(); } catch (e) {}
+        try { return Date.now(); } catch (e) { return 0; }   // keep pruning functional
+    }
+    // Pane key: prefer the arrangement name ('arr:Bass') so a pane's framing is
+    // stable across songs AND distinct between split panes, with no dependency on
+    // the external splitscreen panel index (which isn't always available). Fall
+    // back to a per-instance id ('pane:3') when there's no arrangement.
+    function _aspectPaneKey(arrangement, uid) {
+        const a = (typeof arrangement === 'string') ? arrangement.trim() : '';
+        return a ? ('arr:' + a) : ('pane:' + uid);
+    }
+    // Human label derived from the key.
+    function _aspectPaneLabel(paneKey) {
+        if (paneKey.slice(0, 4) === 'arr:') return paneKey.slice(4);
+        if (paneKey.slice(0, 5) === 'pane:') return 'Pane ' + paneKey.slice(5);
+        return paneKey;
+    }
+
+    // Get-or-create the shared bridge object, seeded from defaults + localStorage.
+    // May carry a sparse `__panels` map of per-pane overrides.
+    function _aspectTune() {
+        let t = window.__h3dAspectTune;
+        if (!t || typeof t !== 'object') {
+            t = Object.assign({}, _ASPECT_DEFAULTS);
+            try {
+                const raw = localStorage.getItem(_ASPECT_LS);
+                if (raw) Object.assign(t, JSON.parse(raw));
+            } catch (e) {}
+            window.__h3dAspectTune = t;
+        }
+        return t;
+    }
+    // Bumped on every tune mutation (all writes funnel through _aspectPersist) so
+    // the per-pane resolve cache below can invalidate cheaply.
+    let _aspectRev = 0;
+    function _aspectPersist() {
+        _aspectRev++;
+        try {
+            const t = _aspectTune(), out = {};
+            Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = t[k]; });
+            // Persist per-pane overrides keyed by arrangement ('arr:*') only, so a
+            // pane's framing carries across songs. Instance-id fallback keys
+            // ('pane:*') are session-only — persisting them would leak a new key
+            // every reload.
+            if (t.__panels) {
+                const p = {}; let any = false;
+                Object.keys(t.__panels).forEach((k) => {
+                    if (k.slice(0, 4) === 'arr:') { p[k] = t.__panels[k]; any = true; }
+                });
+                if (any) out.__panels = p;
+            }
+            localStorage.setItem(_ASPECT_LS, JSON.stringify(out));
+        } catch (e) {}
+    }
+
+    // Resolve the effective tune for a pane: the shared base, with that pane's
+    // override keys (if any) laid on top. Called every frame per renderer, so the
+    // merged object is memoized per pane and only rebuilt when the tune mutates
+    // (_aspectRev changes). Panes with no override return the base directly (no
+    // allocation).
+    const _aspectResolveCache = new Map();   // paneKey -> { rev, obj }
+    function _resolveTuneFor(paneKey) {
+        const base = _aspectTune();
+        const ov = base.__panels && base.__panels[paneKey];
+        if (!ov) return base;
+        const c = _aspectResolveCache.get(paneKey);
+        if (c && c.rev === _aspectRev) return c.obj;
+        const out = {};
+        Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = (k in ov) ? ov[k] : base[k]; });
+        _aspectResolveCache.set(paneKey, { rev: _aspectRev, obj: out });
+        return out;
+    }
+    // Record a live pane so the Target dropdown can list it. Called every frame
+    // by each renderer with its pane key. `seen` is refreshed each call for
+    // pruning; the dropdown is only marked dirty when a pane is newly added — not
+    // on every re-report, which would flicker the <select>.
+    function _aspectRegisterPane(paneKey) {
+        const reg = window.__h3dAspectPanes || (window.__h3dAspectPanes = {});
+        const label = _aspectPaneLabel(paneKey);
+        let e = reg[paneKey];
+        if (!e) { e = reg[paneKey] = { label, seen: 0 }; _aspectPanesDirty = true; }
+        else if (e.label !== label) { e.label = label; _aspectPanesDirty = true; }
+        e.seen = _aspectNowMs();
+    }
+    // Drop panes not reported recently (song change, split teardown, pane close).
+    function _aspectPrunePanes() {
+        const reg = window.__h3dAspectPanes;
+        if (!reg) return;
+        const now = _aspectNowMs();
+        const ro = window.__h3dAspectReadout;
+        Object.keys(reg).forEach((k) => {
+            if (now - (reg[k].seen || 0) > 1500) {
+                delete reg[k];
+                // Prune the matching readout slot so it can't grow unbounded as
+                // songs/arrangements churn, and drop a dangling __last pointer.
+                if (ro) { delete ro[k]; if (ro.__last === k) delete ro.__last; }
+                _aspectPanesDirty = true;
+            }
+        });
+    }
+
+    // True while _syncAspectPanel is programmatically refreshing controls, so the
+    // synthetic 'input' events it dispatches to update labels don't write back
+    // into the tune (which would populate a full override for every field and
+    // spam localStorage). Real user input runs with this false.
+    let _aspectSyncing = false;
+    // Read/write against the current edit target ('' → base, else pane override).
+    function _aspectReadVal(k) {
+        const base = _aspectTune();
+        if (!_aspectEditTarget) return base[k];
+        const ov = base.__panels && base.__panels[_aspectEditTarget];
+        return (ov && (k in ov)) ? ov[k] : base[k];
+    }
+    function _aspectWriteVal(k, v) {
+        const base = _aspectTune();
+        if (!_aspectEditTarget) { base[k] = v; }
+        else {
+            const m = base.__panels || (base.__panels = {});
+            (m[_aspectEditTarget] || (m[_aspectEditTarget] = {}))[k] = v;
+        }
+        _aspectPersist();
+    }
+    // Clear a field: for the base target set the explicit auto value (null); for a
+    // pane target delete the override key so the pane re-inherits the base value
+    // (and drop the pane's override object once it's empty).
+    function _aspectClearVal(k) {
+        const base = _aspectTune();
+        if (!_aspectEditTarget) { base[k] = null; }
+        else {
+            const m = base.__panels, ov = m && m[_aspectEditTarget];
+            if (ov) { delete ov[k]; if (!Object.keys(ov).length) delete m[_aspectEditTarget]; }
+        }
+        _aspectPersist();
+    }
+
+    // (Re)build the Target dropdown from the live pane registry, preserving the
+    // current selection when it's still valid.
+    function _aspectBuildTargets() {
+        if (!_aspectTargetSel) return;
+        // Don't yank a dropdown the user is actively interacting with — leave it
+        // dirty and rebuild on a later tick once it's no longer focused.
+        if (document.activeElement === _aspectTargetSel) return;
+        const reg = window.__h3dAspectPanes || {};
+        const keys = Object.keys(reg).sort();
+        _aspectTargetSel.innerHTML = '';
+        const all = document.createElement('option');
+        all.value = ''; all.textContent = keys.length > 1 ? 'All panes' : 'All';
+        _aspectTargetSel.appendChild(all);
+        keys.forEach((pk) => {
+            const o = document.createElement('option');
+            o.value = pk; o.textContent = reg[pk].label;
+            _aspectTargetSel.appendChild(o);
+        });
+        // Force the edit target back to "All" when the Target row is hidden
+        // (single pane) or the selected pane is gone — otherwise a stale pane
+        // target would silently route edits into a hidden (and persistent
+        // arr:*) override in single-player.
+        if (keys.length <= 1 || (_aspectEditTarget && !reg[_aspectEditTarget])) {
+            _aspectEditTarget = '';
+        }
+        _aspectTargetSel.value = _aspectEditTarget;
+        // The Target row only matters with more than one pane (a split). With a
+        // single pane there's nothing to disambiguate, so hide it.
+        if (_aspectTgtRow) _aspectTgtRow.style.display = keys.length > 1 ? '' : 'none';
+        _aspectPanesDirty = false;
+    }
+
+    function _ensureAspectPanel() {
+        if (_aspectPanelEl || typeof document === 'undefined') return;
+        const wrap = document.createElement('div');
+        wrap.id = 'h3d-aspect-tuner';
+        wrap.style.cssText = [
+            'position:fixed', 'top:64px', 'right:12px', 'z-index:99999',
+            'width:236px', 'padding:10px 12px', 'border-radius:8px',
+            'background:rgba(12,18,28,0.92)', 'border:1px solid rgba(120,150,200,0.35)',
+            'box-shadow:0 6px 24px rgba(0,0,0,0.5)', 'color:#cfe0f5',
+            'font:11px/1.35 system-ui,sans-serif', 'user-select:none',
+            'pointer-events:auto',
+        ].join(';');
+
+        // Header: title + close (×). Close hides the panel; the feature keeps
+        // whatever enabled state it had — this is a dismiss, not an A/B toggle.
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;';
+        const title = document.createElement('div');
+        title.textContent = 'Wide-pane framing';
+        title.style.cssText = 'font-weight:700;color:#e8c040;';
+        const close = document.createElement('button');
+        close.type = 'button';                 // never submit if nested in a <form>
+        close.textContent = '×';
+        close.title = 'Close (Shift+A)';
+        close.setAttribute('aria-label', 'Close');
+        close.style.cssText = 'border:none;background:transparent;color:#cfe0f5;font-size:17px;line-height:1;cursor:pointer;padding:0 2px;';
+        close.addEventListener('click', () => _setAspectPanelVisible(false));
+        hdr.appendChild(title); hdr.appendChild(close); wrap.appendChild(hdr);
+
+        // Target selector — which pane the controls below edit.
+        const tgtRow = document.createElement('div'); tgtRow.style.cssText = 'margin:2px 0 7px;';
+        _aspectTgtRow = tgtRow;
+        const tgtLab = document.createElement('div');
+        tgtLab.textContent = 'Target'; tgtLab.style.cssText = 'color:#9fb0c8;margin-bottom:2px;';
+        _aspectTargetSel = document.createElement('select');
+        _aspectTargetSel.setAttribute('aria-label', 'Target pane');
+        _aspectTargetSel.style.cssText = 'width:100%;background:rgba(30,44,66,0.9);color:#cfe0f5;border:1px solid rgba(120,150,200,0.4);border-radius:4px;padding:3px;';
+        _aspectTargetSel.addEventListener('change', () => {
+            _aspectEditTarget = _aspectTargetSel.value; _syncAspectPanel();
+        });
+        tgtRow.appendChild(tgtLab); tgtRow.appendChild(_aspectTargetSel); wrap.appendChild(tgtRow);
+        _aspectBuildTargets();
+
+        // enabled + splitOnly checkboxes (per-target)
+        [['enabled', 'Enabled'], ['splitOnly', 'Split panes only']].forEach(([k, lbl]) => {
+            const row = document.createElement('label');
+            row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:2px 0;cursor:pointer;';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.checked = !!_aspectReadVal(k); cb.dataset.k = k;
+            cb.addEventListener('change', () => { _aspectWriteVal(k, cb.checked); });
+            const span = document.createElement('span'); span.textContent = lbl;
+            row.appendChild(cb); row.appendChild(span); wrap.appendChild(row);
+        });
+
+        // numeric sliders (per-target)
+        _ASPECT_FIELDS.forEach((f) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'margin:5px 0;';
+            const head = document.createElement('div');
+            head.style.cssText = 'display:flex;justify-content:space-between;';
+            const lab = document.createElement('span'); lab.textContent = f.label;
+            const val = document.createElement('span');
+            val.style.cssText = 'color:#8fb6ff;font-variant-numeric:tabular-nums;';
+            head.appendChild(lab); head.appendChild(val); row.appendChild(head);
+            const sl = document.createElement('input');
+            sl.type = 'range'; sl.min = f.min; sl.max = f.max; sl.step = f.step;
+            const rv = _aspectReadVal(f.k);
+            sl.value = Number.isFinite(rv) ? rv : _ASPECT_DEFAULTS[f.k];
+            sl.dataset.k = f.k;
+            sl.style.cssText = 'width:100%;';
+            const show = () => { val.textContent = (+sl.value).toFixed(f.step < 1 ? 2 : 0); };
+            show();
+            sl.addEventListener('input', () => {
+                show();                                   // label always refreshes
+                if (!_aspectSyncing) _aspectWriteVal(f.k, parseFloat(sl.value));
+            });
+            row.appendChild(sl); wrap.appendChild(row);
+        });
+
+        // hfov override (checkbox enables a slider; off → hfovDeg=null = auto)
+        {
+            const row = document.createElement('div'); row.style.cssText = 'margin:5px 0;';
+            const head = document.createElement('label');
+            head.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.checked = Number.isFinite(_aspectReadVal('hfovDeg'));
+            const lbl = document.createElement('span'); lbl.textContent = 'Override held hFOV°';
+            head.appendChild(cb); head.appendChild(lbl); row.appendChild(head);
+            const sl = document.createElement('input');
+            sl.type = 'range'; sl.min = 40; sl.max = 160; sl.step = 1;
+            const hv = _aspectReadVal('hfovDeg');
+            sl.value = Number.isFinite(hv) ? hv : 102;
+            sl.disabled = !cb.checked;
+            sl.style.cssText = 'width:100%;';
+            cb.addEventListener('change', () => {
+                if (_aspectSyncing) return;
+                sl.disabled = !cb.checked;
+                if (cb.checked) _aspectWriteVal('hfovDeg', parseFloat(sl.value));
+                else _aspectClearVal('hfovDeg');   // base → auto (null); pane → re-inherit base
+            });
+            sl.addEventListener('input', () => {
+                if (!_aspectSyncing && cb.checked) _aspectWriteVal('hfovDeg', parseFloat(sl.value));
+            });
+            row.appendChild(sl); wrap.appendChild(row);
+            _aspectHfovCb = cb; _aspectHfovSl = sl;
+        }
+
+        // live readout
+        _aspectPanelRO = document.createElement('div');
+        _aspectPanelRO.style.cssText = 'margin-top:6px;padding-top:6px;border-top:1px solid rgba(120,150,200,0.25);color:#9fb;font-variant-numeric:tabular-nums;';
+        _aspectPanelRO.textContent = 'aspect — · vFOV —';
+        wrap.appendChild(_aspectPanelRO);
+
+        // buttons
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:6px;margin-top:8px;';
+        const mkBtn = (txt, fn) => {
+            const b = document.createElement('button');
+            b.type = 'button';                 // never submit if nested in a <form>
+            b.textContent = txt;
+            b.style.cssText = 'flex:1;padding:4px 0;border-radius:5px;border:1px solid rgba(120,150,200,0.4);background:rgba(40,60,90,0.6);color:#cfe0f5;cursor:pointer;font:11px system-ui;';
+            b.addEventListener('click', fn);
+            return b;
+        };
+        // Reset: for "All" restores the shared defaults exactly; for a pane
+        // clears that pane's override so it inherits the shared base again. Panel
+        // visibility is independent (Shift+A / ×), so Reset doesn't force it open.
+        btnRow.appendChild(mkBtn('Reset', () => {
+            const base = _aspectTune();
+            if (!_aspectEditTarget) {
+                Object.keys(_ASPECT_DEFAULTS).forEach((k) => { base[k] = _ASPECT_DEFAULTS[k]; });
+            } else if (base.__panels) {
+                delete base.__panels[_aspectEditTarget];
+            }
+            _aspectPersist(); _syncAspectPanel();
+        }));
+        // Copy: the resolved values for the current target, as JSON.
+        btnRow.appendChild(mkBtn('Copy', () => {
+            const r = _aspectEditTarget ? _resolveTuneFor(_aspectEditTarget) : _aspectTune();
+            const out = {};
+            Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = r[k]; });
+            const json = JSON.stringify(out, null, 2);
+            try { console.log('[h3d] wide-pane framing values (' + (_aspectEditTarget || 'all') + '):\n' + json); } catch (e) {}
+            try { if (navigator.clipboard) navigator.clipboard.writeText(json); } catch (e) {}
+        }));
+        wrap.appendChild(btnRow);
+
+        document.body.appendChild(wrap);
+        _aspectPanelEl = wrap;
+        _aspectPanelEl.style.display = 'none';
+    }
+
+    // Push the current target's values back into the panel controls (after Reset,
+    // a target switch, or an external edit). Cheap; only runs on demand.
+    function _syncAspectPanel() {
+        if (!_aspectPanelEl) return;
+        _aspectBuildTargets();
+        // Guard so the synthetic 'input' events below only refresh labels and
+        // don't write the read-back values into the target (which would turn a
+        // sparse pane override into a full one and spam localStorage).
+        _aspectSyncing = true;
+        try {
+            _aspectPanelEl.querySelectorAll('input[type=checkbox][data-k]').forEach((cb) => {
+                cb.checked = !!_aspectReadVal(cb.dataset.k);
+            });
+            _aspectPanelEl.querySelectorAll('input[type=range][data-k]').forEach((sl) => {
+                const v = _aspectReadVal(sl.dataset.k);
+                if (Number.isFinite(v)) sl.value = v;
+                sl.dispatchEvent(new Event('input'));   // refresh the value label only
+            });
+            if (_aspectHfovCb) {
+                const hv = _aspectReadVal('hfovDeg');
+                _aspectHfovCb.checked = Number.isFinite(hv);
+                _aspectHfovSl.disabled = !_aspectHfovCb.checked;
+                if (Number.isFinite(hv)) _aspectHfovSl.value = hv;
+            }
+        } finally {
+            _aspectSyncing = false;
+        }
+    }
+
+    function _setAspectPanelVisible(on) {
+        _ensureAspectPanel();
+        if (!_aspectPanelEl) return;
+        _aspectPanelEl.style.display = on ? 'block' : 'none';
+        window.__h3dAspectPanelOpen = !!on;        // gates the per-frame readout publish
+        // Prune before the first build so panes from a prior song/split don't
+        // flash in the dropdown until the first RAF tick.
+        if (on) { _aspectPrunePanes(); _aspectBuildTargets(); }
+        if (on && !_aspectPanelRAF) {
+            const tick = () => {
+                if (!window.__h3dAspectPanelOpen) { _aspectPanelRAF = 0; return; }
+                _aspectPrunePanes();
+                if (_aspectPanesDirty) _aspectBuildTargets();
+                const ro = window.__h3dAspectReadout;
+                if (_aspectPanelRO && ro) {
+                    const key = _aspectEditTarget || ro.__last;
+                    const e = key && ro[key];
+                    if (e && Number.isFinite(e.aspect)) {
+                        _aspectPanelRO.textContent =
+                            'aspect ' + e.aspect.toFixed(2) + ' · vFOV ' + e.vfov.toFixed(1) + '°';
+                    }
+                }
+                _aspectPanelRAF = requestAnimationFrame(tick);
+            };
+            _aspectPanelRAF = requestAnimationFrame(tick);
+        }
+    }
+    // Toggle the panel open/closed (the Shift+A dismiss/reveal).
+    function _toggleAspectPanel() {
+        _ensureAspectPanel();
+        const open = !(_aspectPanelEl && _aspectPanelEl.style.display !== 'none');
+        _setAspectPanelVisible(open);
+        if (open) _syncAspectPanel();
     }
 
     /* ======================================================================
@@ -917,7 +2084,7 @@
      *
      *  Audio-reactive ambient scenery in the fog band beyond the highway.
      *  Module-level singletons share an AudioContext + AnalyserNode tap on
-     *  the slopsmith core <audio id="audio"> element across all panel
+     *  the feedBack core <audio id="audio"> element across all panel
      *  instances; per-panel settings live in localStorage with a global
      *  fallback so settings.html drives a single default while per-panel
      *  overrides (h3d_bg_panel<idx>_*) can be set for splitscreen layouts.
@@ -957,7 +2124,7 @@
         const key = `${outcome}:${status}:${reason}`;
         if (_bgBridgeKeys.get(bridgeId) === key) return;
         _bgBridgeKeys.set(bridgeId, key);
-        const session = window.slopsmith && window.slopsmith.audioSession;
+        const session = window.feedBack && window.feedBack.audioSession;
         if (!session || typeof session.recordBridgeHit !== 'function') return;
         try {
             session.recordBridgeHit({
@@ -974,14 +2141,14 @@
 
     function _bgGetAnalyser() {
         // Prefer the stems plugin's side-chain analyser when a sloppak is
-        // loaded. As of slopsmith-plugin-stems 0.5.0 (sample-locked playback)
+        // loaded. As of feedBack-plugin-stems 0.5.0 (sample-locked playback)
         // the #audio element is a silent virtual transport on sloppaks, so
         // tapping it sees only silence; the stems mix is exposed at
-        // window.slopsmith.stems.getAnalyser() instead. The stems plugin
+        // window.feedBack.stems.getAnalyser() instead. The stems plugin
         // creates and destroys that AnalyserNode per song, so we re-check
         // each call and key the cache on its identity — when the node
         // changes (song switch), the cache is replaced automatically.
-        const stemsApi = window.slopsmith && window.slopsmith.stems;
+        const stemsApi = window.feedBack && window.feedBack.stems;
         const stemsAnalyser = (stemsApi && typeof stemsApi.getAnalyser === 'function')
             ? stemsApi.getAnalyser() : null;
         if (stemsAnalyser) {
@@ -999,7 +2166,7 @@
                     freq: new Uint8Array(Math.max(BG_FREQ_BINS, stemsAnalyser.frequencyBinCount)),
                     source: 'stems',
                 };
-                _bgRecordAudioBridge('audio-mix.analyser', 'window.slopsmith.stems.getAnalyser', 'handled', '', 'stems');
+                _bgRecordAudioBridge('audio-mix.analyser', 'window.feedBack.stems.getAnalyser', 'handled', '', 'stems');
             }
             return _bgAudio;
         }
@@ -1099,14 +2266,91 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'chords', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: false, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: false, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true, slideArrowApproachVisible: true, slideArrowNeckVisible: true, slideArrowChainPreviewVisible: true };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', bgTheme: 'default', hwTheme: 'default', showFretOnNote: true, fretNumberGhostScope: 'chords', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: false, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: false, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true, slideArrowApproachVisible: true, slideArrowNeckVisible: true, slideArrowChainPreviewVisible: true, hitFx: 0.7, sparks: true, cinematic: true, verdictMarks: true, timingFx: true, streakFx: true, bloom: true };
     // User-selectable, persistable bg styles — must mirror settings.html's
     // VALID_STYLES. 'venue' is deliberately NOT here: it is an internal effective
     // style reached only via _venueSceneOverride (the viz-picker Venue flow), so
     // _bgCoerce must reject a stored h3d_bg_style='venue' — otherwise venue could
     // mount outside that flow and settings.html (which can't represent 'venue')
     // would be unable to switch back. BG_STYLES still has a 'venue' renderer entry.
-    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
+    const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'butterchurn', 'image', 'video'];
+    // Scene color themes — TWO INDEPENDENT AXES sharing one palette family.
+    // The combined `BG_THEMES` table below is the single source of truth; each
+    // entry carries the colors for BOTH axes, but the two axes are selected and
+    // applied SEPARATELY (two dropdowns, two settings keys):
+    //   • BACKGROUND axis (setting key `bgTheme`) owns:
+    //       clear — WebGL clear color (the empty background behind everything)
+    //       fog   — distance fog tint (kept === clear so the horizon dissolves
+    //               cleanly instead of showing a seam)
+    //   • HIGHWAY axis (setting key `hwTheme`) owns:
+    //       board   — the fretboard / highway-surface plane color
+    //       lane    — the lit highway lane strip under the gems (optional)
+    //       laneDim — the lane's dimmer alternating row (optional)
+    // Because both axes read from the SAME id-set (the keys of this table), ANY
+    // background id can mix with ANY highway id (e.g. Deep Focus background +
+    // Cathode Green highway); picking the SAME id in both gives the original
+    // "matched" combined look. _bgBackgroundColors()/_bgHighwayColors() below
+    // are the per-axis accessors; both fall back to 'default' for unknown ids.
+    // 'default' reproduces the original look byte-for-byte on BOTH axes, so
+    // existing users (and anyone who never touches either setting) see no
+    // change. A migration in _bgLoadSettings() makes an existing single-`bgTheme`
+    // pick drive BOTH axes until the user diverges them, so upgrades are
+    // visually identical too. All themes keep the board very dark and the
+    // background dark so the bright per-string note gems, lane, and labels
+    // retain contrast. NOTE: settings.html mirrors these ids in its
+    // VALID_BG_THEMES set (shared by both dropdowns) — keep them in sync.
+    // Optional `lane` / `laneDim` fields retint the lit highway lane strip + its
+    // dimmer alternating row. A theme that omits them falls back to the stock
+    // blue lane (HWY_LANE_STRIPE_ODD_HEX / _EVEN_HEX); only 'default' relies on
+    // that fallback (so its output stays byte-identical). Every other theme sets
+    // its own lane so the Highway axis is visibly distinct entry-to-entry — the
+    // near-black neutral boards alone aren't separable, so the lane carries it.
+    // See _applyBgTheme().
+    const BG_THEMES = {
+        default:    { clear: 0x101820, fog: 0x101820, board: 0x08080e },
+        // Cool navy surface + a brighter pure-blue lane, so it reads distinct
+        // from 'default' (neutral board + stock teal-blue lane) on the Highway axis.
+        midnight:   { clear: 0x0a0e1a, fog: 0x0a0e1a, board: 0x080d1c, lane: 0x244fae, laneDim: 0x122a5e },
+        // Lighter NEUTRAL-grey surface + a steel-grey lane — the only mid-dark
+        // neutral board, so the surface itself is visibly different from the
+        // near-black neutrals around it (board kept dark enough for gem contrast).
+        charcoal:   { clear: 0x16181c, fog: 0x16181c, board: 0x141417, lane: 0x525a66, laneDim: 0x282d34 },
+        deeppurple: { clear: 0x140a1e, fog: 0x140a1e, board: 0x0b0610, lane: 0x3a1f6e, laneDim: 0x1f1040 },
+        forest:     { clear: 0x0a1614, fog: 0x0a1614, board: 0x06100c, lane: 0x15602a, laneDim: 0x0a3318 },
+        // Warm dark neutral (espresso/umber) — the first non-cool scene.
+        warmslate:  { clear: 0x1c130b, fog: 0x1c130b, board: 0x0e0805, lane: 0x5e3a12, laneDim: 0x341f0a },
+        // Recessive near-black neutral (a hair above #000000, ~zero chroma) —
+        // maximizes gem-vs-board contrast; a clean stage/stream look. Purest-dark
+        // board + a clean steel-cyan lane (brighter/cooler than 'default's muted
+        // teal-blue) so the Highway axis reads clearly distinct from default.
+        deepfocus:  { clear: 0x0c0c0d, fog: 0x0c0c0d, board: 0x060606, lane: 0x2f7fa0, laneDim: 0x163c4e },
+        // Calm dark teal — blue-dominant so it reads distinct from the navy
+        // 'midnight' and the green 'forest'.
+        deepsea:    { clear: 0x06222b, fog: 0x06222b, board: 0x03141a, lane: 0x0e5a63, laneDim: 0x063338 },
+        // Retro CRT glow — a warm AMBER phosphor cast (the classic amber
+        // terminal). Amber rather than green so a phosphor board can't crush
+        // green/teal gems, and so it stays clearly distinct from 'forest' and
+        // 'deepsea'. Board stays very dark / low-chroma to keep gems popping.
+        cathode:    { clear: 0x140b03, fog: 0x140b03, board: 0x0c0702, lane: 0x6e4a0e, laneDim: 0x3a2806 },
+        // Retro CRT GREEN phosphor — leaned more saturated / cyan-green than
+        // 'forest' so it reads as a terminal, not woodland (dRGB 35 vs forest,
+        // 32 vs deepsea). Phosphor-green board + green lane. Verified to keep
+        // green/teal gems legible (green-on-green floor CR ~2.2).
+        cathodegreen: { clear: 0x07301a, fog: 0x07301a, board: 0x031a0c, lane: 0x0e6e2a, laneDim: 0x073a18 },
+        // Warm hearth — the first warm-RED scene, pairs with the Ember/Sunrise
+        // strings. Deep red, pushed away from the amber 'cathode'/'warmslate'
+        // (dRGB ~26 from cathode). Ember-red lane.
+        hearth:     { clear: 0x280806, fog: 0x280806, board: 0x1a0606, lane: 0x7a2410, laneDim: 0x3f1409 },
+    };
+    const BG_THEME_IDS = Object.keys(BG_THEMES);
+    // Shared lookup for the combined entry (both axes are keyed by the same id
+    // set, so a single id list / coerce check validates either axis).
+    function _bgThemeColors(id) { return BG_THEMES[id] || BG_THEMES.default; }
+    // Per-axis accessors. Background reads clear/fog; highway reads
+    // board/lane/laneDim. They alias the same table — splitting at read-time
+    // keeps one source of truth while letting the two dropdowns pick freely.
+    function _bgBackgroundColors(id) { return _bgThemeColors(id); }
+    function _bgHighwayColors(id) { return _bgThemeColors(id); }
     const VENUE_SCENE_ASSET_BASE = '/static/assets/venue/themes/small-club/';
     const VENUE_BG_PLATE_PNG = 'bg-plate.png';
     const VENUE_BG_PLATE_WEBP = 'bg-plate.webp';
@@ -1328,7 +2572,7 @@
     const FRET_NUMBER_GHOST_SCOPE_IDS = ['chords', 'all'];
 
     function _bgPanelKey(canvas) {
-        const ss = window.slopsmithSplitscreen;
+        const ss = window.feedBackSplitscreen;
         const idx = (ss && typeof ss.panelIndexFor === 'function') ? ss.panelIndexFor(canvas) : null;
         return (idx == null) ? 'main' : 'panel' + idx;
     }
@@ -1369,7 +2613,7 @@
     // means (fall back to default rather than silently flipping to
     // false). Add new boolean keys to BG_DEFAULTS and they pick this
     // up via the dispatch below.
-    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible', 'chordDiagramVisible', 'fpsVisible', 'toneHudVisible', 'fretDividersVisible', 'slideArrowApproachVisible', 'slideArrowNeckVisible', 'slideArrowChainPreviewVisible']);
+    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible', 'chordDiagramVisible', 'fpsVisible', 'toneHudVisible', 'fretDividersVisible', 'slideArrowApproachVisible', 'slideArrowNeckVisible', 'slideArrowChainPreviewVisible', 'sparks', 'cinematic', 'verdictMarks', 'timingFx', 'streakFx', 'bloom']);
     function _bgCoerceBool(val, fallback) {
         if (val === 'true' || val === '1') return true;
         if (val === 'false' || val === '0') return false;
@@ -1379,7 +2623,7 @@
     // hysteresis; zoomSmoothing the zoom dead zone; tiltSmoothing the
     // vertical-tilt deadband + correction strength. All three slider-
     // shaped settings share the same parse + clamp behaviour.
-    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize', 'toneHudSize']);
+    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize', 'toneHudSize', 'hitFx']);
     function _bgCoerce(key, val) {
         if (_BG_FLOAT_KEYS.has(key)) {
             const n = parseFloat(val);
@@ -1388,6 +2632,9 @@
         if (_BG_BOOL_KEYS.has(key)) return _bgCoerceBool(val, BG_DEFAULTS[key]);
         if (key === 'style') return BG_STYLE_IDS.includes(val) ? val : BG_DEFAULTS.style;
         if (key === 'palette') return (PALETTE_IDS.includes(val) || val === 'custom') ? val : BG_DEFAULTS.palette;
+        if (key === 'bgTheme') return BG_THEME_IDS.includes(val) ? val : BG_DEFAULTS.bgTheme;
+        // Highway axis shares the same id-set as the background axis.
+        if (key === 'hwTheme') return BG_THEME_IDS.includes(val) ? val : BG_DEFAULTS.hwTheme;
         if (key === 'chordDiagramPosition')
             return CHORD_DIAG_POSITION_IDS.includes(val) ? val : BG_DEFAULTS.chordDiagramPosition;
         if (key === 'sectionHudPosition')
@@ -1459,6 +2706,20 @@
     window.h3dBgSetIntensity = (v) => _bgWriteGlobal('intensity', v);
     window.h3dBgSetReactive = (v) => _bgWriteGlobal('reactive', !!v);
     window.h3dBgSetPalette = (v) => _bgWriteGlobal('palette', v);
+    // BACKGROUND scene-color axis (clear + fog only). Validated against
+    // BG_THEME_IDS in _bgCoerce; the listener re-applies clear/fog live and
+    // independently of the highway axis.
+    window.h3dBgSetBgTheme = (v) => {
+        const s = String(v);
+        _bgWriteGlobal('bgTheme', BG_THEME_IDS.includes(s) ? s : BG_DEFAULTS.bgTheme);
+    };
+    // HIGHWAY scene-color axis (board + lane + laneDim). Same id-set as the
+    // background axis, so any highway can mix with any background. The listener
+    // re-applies the board plane + lane live and independently.
+    window.h3dBgSetHwTheme = (v) => {
+        const s = String(v);
+        _bgWriteGlobal('hwTheme', BG_THEME_IDS.includes(s) ? s : BG_DEFAULTS.hwTheme);
+    };
     // Apply a user-defined per-string color set (core theming UI). `hexArray`
     // is up to 8 hex strings; invalid/missing entries fall back to the default
     // palette per index. Writes the colors, then flips the palette to 'custom'
@@ -1496,6 +2757,13 @@
     window.h3dBgSetTextSize = (v) => _bgWriteGlobal('textSize', v);
     window.h3dBgSetVibrancy = (v) => _bgWriteGlobal('vibrancy', v);
     window.h3dBgSetGlow     = (v) => _bgWriteGlobal('glow', v);
+    window.h3dBgSetHitFx        = (v) => _bgWriteGlobal('hitFx', v);
+    window.h3dBgSetSparks       = (v) => _bgWriteGlobal('sparks', !!v);
+    window.h3dBgSetCinematic    = (v) => _bgWriteGlobal('cinematic', !!v);
+    window.h3dBgSetVerdictMarks = (v) => _bgWriteGlobal('verdictMarks', !!v);
+    window.h3dBgSetTimingFx     = (v) => _bgWriteGlobal('timingFx', !!v);
+    window.h3dBgSetStreakFx     = (v) => _bgWriteGlobal('streakFx', !!v);
+    window.h3dBgSetBloom        = (v) => _bgWriteGlobal('bloom', !!v);
     window.h3dBgSetToneHudVisible   = (v) => _bgWriteGlobal('toneHudVisible', !!v);
     window.h3dBgSetToneHudPosition  = (v) => _bgWriteGlobal('toneHudPosition', v);
     window.h3dBgSetToneHudSize      = (v) => _bgWriteGlobal('toneHudSize', v);
@@ -2300,7 +3568,7 @@
                     // never sees a tainted canvas. Setting
                     // `crossOrigin = "anonymous"` would also strip
                     // cookies from the fetch, which would 401 against
-                    // any cookie-protected slopsmith deployment. If
+                    // any cookie-protected feedBack deployment. If
                     // this ever needs to fetch cross-origin, switch
                     // to `use-credentials` AND have the server send
                     // the matching CORS headers.
@@ -2446,7 +3714,7 @@
     let _nextInstanceId = 0;
 
     /* ======================================================================
-     *  Factory — slopsmith#36 setRenderer contract
+     *  Factory — feedBack#36 setRenderer contract
      * ====================================================================== */
 
     function createFactory() {
@@ -2455,8 +3723,11 @@
         // ── Per-instance Three.js state ───────────────────────────────────
         let scene = null, cam = null, ren = null;
         let wrap = null;
-        // highway:visibility listener (slopsmith#246). Hides the .h3d-wrap
-        // overlay when slopsmith's canvas is display:none'd (splitscreen
+        let bcCtrl = null; // Butterchurn audio-reactive background (the 'butterchurn' bg-style)
+        let _chartEnv = 0, _chartPrevT = -1, _bcBeatIdx = 0, _bcNoteIdx = 0, _bcChordIdx = 0, _bcTintTarget = null;
+        let _tintR = 20, _tintG = 24, _tintB = 40; // smoothed instrument-color tint for the bg
+        // highway:visibility listener (feedBack#246). Hides the .h3d-wrap
+        // overlay when feedBack's canvas is display:none'd (splitscreen
         // case). Without this, the wrap is a *sibling* of #highway so
         // hiding #highway leaves the WebGL scene painting full-screen.
         // Bound in initScene after wrap creation, unbound in destroy().
@@ -2534,6 +3805,13 @@
         let _drawRecentByString = null;
         /** Snapshotted in update() — drawNote() is a sibling of update(), not nested in its closure. */
         let _drawChordTemplates = null;
+        /** Teaching marks sd/ch overlay pref (§6.2.2), mirrored from the 2D
+         * highway's `teachingMarksVisible` bundle flag. */
+        let _drawTeachingMarks = false;
+        /** Fret-hand finger (fg) hint pref, mirrored from the 2D highway's
+         * `fingerHintsVisible` bundle flag — default on (shown unless an explicit
+         * false), hideable independently of the sd/ch overlays. */
+        let _showFingerHints = true;
         let _laneTargetColor = null;
         let _renderScale = 1;
         let lyricsCanvas = null, lyricsCtx = null;
@@ -2545,6 +3823,42 @@
         let _fpsEma = 0;
         let _fpsDisplay = 0;
         let _fpsLastSampleT = 0;
+        // The FPS readout is pinned top-right of the highway overlay — the same
+        // corner the v3 player chrome stacks its persistent "Up Next" pill and
+        // live-performance HUD into, on a higher layer that paints over the
+        // canvas. So out of the box the readout sits *behind* that chrome and
+        // can't be read (exactly when you've turned it on to judge perf). Rather
+        // than relocate it (testers look top-right), we drop it just BELOW
+        // whichever of that chrome is showing. Refs are resolved once and cached
+        // — never a per-frame querySelector (see CLAUDE.md "never run DOM queries
+        // on a per-frame path") — and re-resolved only when a node detaches.
+        let _v3HudEls = null;
+        // Returns the bottom edge (in overlay-canvas px, which are 1:1 CSS px on
+        // this overlay) of the lowest visible top-right v3 chrome element, or 0
+        // when none apply (classic v2 UI, or all hidden). Only called while the
+        // FPS readout is actually drawn, so the layout reads cost nothing in the
+        // common (counter-off) case.
+        function _v3TopRightChromeBottom() {
+            if (typeof document === 'undefined' || !highwayCanvas) return 0;
+            // Only the v3 chrome stacks persistent HUD elements over the canvas's
+            // top-right. Gate on the documented detector so this is a strict no-op
+            // in classic v2 (where 'hud-time' also exists but sits elsewhere).
+            if (!(window.feedBack && window.feedBack.uiVersion === 'v3')) return 0;
+            if (!_v3HudEls || _v3HudEls.some((el) => el && !el.isConnected)) {
+                _v3HudEls = ['v3-upnext', 'v3-live-performance-hud', 'hud-time']
+                    .map((id) => document.getElementById(id));
+            }
+            const top = highwayCanvas.getBoundingClientRect().top;
+            let maxBottom = 0;
+            for (const el of _v3HudEls) {
+                // offsetParent === null ⇒ display:none (a `.hidden` pill/HUD) or
+                // not laid out — don't duck under something that isn't shown.
+                if (!el || el.offsetParent === null) continue;
+                const b = el.getBoundingClientRect().bottom - top;
+                if (b > maxBottom) maxBottom = b;
+            }
+            return maxBottom;
+        }
         let _diagChord            = null;
         // Chord diagram render cache. Keys: static layout inputs joined as a
         // string. Values: OffscreenCanvas (or <canvas>) rendered at opacity=1
@@ -2672,6 +3986,24 @@
         // that CSS-box drift and re-frame, instead of the user having to
         // un/re-maximize the window.
         let _appliedW = 0, _appliedH = 0;
+        // Last pane aspect (w/h) handed to the camera, cached so camUpdate can
+        // recompute the horizontal-FOV-hold each frame (and react to live
+        // __h3dAspectTune edits) without waiting for a resize. 0 until first
+        // applySize().
+        let _paneAspect = 0;
+        // Per-instance fallback id for the wide-pane tuner's pane key, used only
+        // when this pane has no arrangement name to key by. Assigned once in
+        // init(); overrides keyed off arrangement persist across songs, this
+        // fallback is session-only.
+        let _paneUid = 0;
+        // True once applySize() has pinned the .h3d-wrap overlay to the
+        // highway canvas's offset box. Stays false while the canvas has no
+        // layout yet (init() can run before #highway has a real box, where
+        // applySize falls back to the parent-panel size and only sets the
+        // wrap height). The rAF loop re-pins once the canvas lays out even
+        // when the logical render size is unchanged — otherwise the overlay
+        // would stay at top:0;left:0;right:0 and expose a strip of #highway.
+        let _wrapPinned = false;
         let mBeatM = null, mBeatQ = null;
         let txtCache = {};
         // Cloned sprite materials cached on individual sprite instances
@@ -2699,6 +4031,13 @@
         let bgGroup = null, bgStage = null, bgState = null;
         let bgMountedStyleId = null;
         let bgStyleId = 'particles', bgIntensity = 0.5, bgReactive = true;
+        // Active scene color theme (background + highway surface). Read in
+        // _bgLoadSettings, applied by _applyBgTheme (clear + fog + board plane).
+        let bgThemeId = 'default';   // BACKGROUND axis (clear + fog)
+        let hwThemeId = 'default';   // HIGHWAY axis (board + lane + laneDim)
+        // Board (fretboard/highway-surface) plane material — kept so the theme
+        // can recolor it live without rebuilding the board. Set in buildBoard().
+        let _boardPlaneMat = null;
         // Per-render opt-out for plugins borrowing the highway as a viz: when the
         // mount bundle sets bgReactive === false, suppress the audio-reactive
         // background for THIS instance only (no shared h3d_bg_* write). Captured
@@ -2764,6 +4103,19 @@
         // linear blend every frame.
         let vibrancy            = BG_DEFAULTS.vibrancy;
         let glowMul             = BG_DEFAULTS.glow;
+        let _hitFx              = BG_DEFAULTS.hitFx;
+        let _sparks             = BG_DEFAULTS.sparks;
+        let _cinematic          = BG_DEFAULTS.cinematic;
+        let _verdictMarks       = BG_DEFAULTS.verdictMarks;
+        let _timingFx           = BG_DEFAULTS.timingFx;
+        let _streakFx           = BG_DEFAULTS.streakFx;
+        let _bloom              = BG_DEFAULTS.bloom;
+        let _composer = null, _bloomPass = null, _bloomLoad = null, _bloomW = 0, _bloomH = 0;
+        let _sparkPts = null, _sparkPos = null, _sparkCol = null, _sparkVel = null, _sparkLife = null;
+        const _SPARK_N = 256;
+        const _sparkSeen = new Map();     // note-key -> expiry; one burst per hit
+        let _juiceLastT = 0;              // frame-dt clock for the juice layer
+        let _streakHits = 0, _streakHeat = 0;  // #7 consecutive-hit escalation
         let fpsVisible           = BG_DEFAULTS.fpsVisible;
         let fretDividersVisible  = BG_DEFAULTS.fretDividersVisible;
         let chordDiagramVisible  = BG_DEFAULTS.chordDiagramVisible;
@@ -2803,9 +4155,9 @@
 
         // Notedetect feedback (issue #9). Per-panel mark queues populated
         // by two event sources: (a) legacy `notedetect:hit` /
-        // `notedetect:miss` window CustomEvents, and (b) Slopsmith
+        // `notedetect:miss` window CustomEvents, and (b) FeedBack
         // event-bus `note:hit` / `note:miss` events (subscribed in
-        // initScene() when window.slopsmith exposes both `on` and `off`).
+        // initScene() when window.feedBack exposes both `on` and `off`).
         // Both sources feed the same _ndPushMark() helper which dedupes
         // dual emissions. drawNote looks up its (s, f, t) against these
         // arrays each frame and swaps the outline material when a match
@@ -2862,7 +4214,7 @@
         // no longer reads it — pruning lives once per frame so
         // drawNote's hot path is just the bounded (s, f, t) match.
         let _ndFrameNowMs = 0;
-        // slopsmith#254 — core's per-note judgment provider, captured
+        // feedBack#254 — core's per-note judgment provider, captured
         // from `bundle.getNoteState` at the top of each update(). When
         // present it's authoritative over the event-driven marks above:
         // 'hit'/'active' → bright string-tinted outline (mGlow[s]) +
@@ -2873,7 +4225,7 @@
         // with no scorer registered. Older note_detect builds that only
         // emit notedetect:hit/miss events still work via _ndHitMarks.
         let _ndGetNoteState = null;
-        let _ndHasProvider = false;  // true iff a note-state provider is registered (slopsmith#254)
+        let _ndHasProvider = false;  // true iff a note-state provider is registered (feedBack#254)
         // Sustain verdict latch — persists a provider's hit/miss verdict for the
         // full duration of a sustained note. Once hitGlowDuration expires the
         // provider stops returning state; the latch re-injects the last verdict
@@ -2937,7 +4289,7 @@
         let _fxPalette = _FX_PALETTES.neon;
         function _fxResolvePalette() {
             let skin = null;
-            try { skin = localStorage.getItem('slopsmith_notedetect_skin'); } catch (e) {}
+            try { skin = localStorage.getItem('feedBack_notedetect_skin'); } catch (e) {}
             _fxPalette = _FX_PALETTES[skin] || _FX_PALETTES.neon;
         }
         function _fxSpawnPop(popKey, points, mult, x, y, z) {
@@ -3017,6 +4369,7 @@
         let gPMXLines = null, pMuteXLines = null; // PM X lines combined geometry (8 segs as quads)
         let gFHXLines = null, pFHXLines = null;   // FH X lines combined geometry
         let pNoteFretLabel, pConnectorLine, pDropLine, pTapChevron, pAccentHalo;
+        let pTeachMarkLbl;  // teaching marks fg/sd label sprites (§6.2.2)
         let pHaloBar = null, gHaloBar = null; // gradient halo bar geometry — replaces per-shell pChordAccentHalo
         let gArpBracket = null; // shared 1×1×1 box geometry for pArpBracket; built once, disposed in teardown
         let pSusRibbon = null, pSusRibbonOl = null;
@@ -3246,6 +4599,11 @@
 
         let tgtX = xFretMid(CAM_LOCK_CENTER_FRET), curX = xFretMid(CAM_LOCK_CENTER_FRET);
         let tgtDist = CAM_DIST_BASE, curDist = CAM_DIST_BASE;
+        // Dolly-back multiplier applied to the curDist lerp target by camUpdate's
+        // fret-row fit guard. 1 = no extra pull-back (the common case); rises
+        // toward FRET_ROW_FIT_BOOST_MAX only when a tight, centred zoom would push
+        // the fret-number row past the bottom edge, then relaxes back to 1.
+        let _fretRowFitBoost = 1;
         // Last committed lowFretBonus contribution baked into tgtDist
         // (see candidateDist block — bonus is applied on top of the
         // hysteresis-gated base).
@@ -3340,7 +4698,7 @@
 
         function _unsubscribeFocus() {
             if (!_focusSubscribed) return;
-            const ss = window.slopsmithSplitscreen;
+            const ss = window.feedBackSplitscreen;
             if (ss && typeof ss.offFocusChange === 'function') ss.offFocusChange(_onFocusChange);
             _focusSubscribed = false;
         }
@@ -4047,7 +5405,7 @@
         }
 
         // ── Object pool ────────────────────────────────────────────────────
-        // ── Opt-in perf bench harness (slopsmith#226) ──────────────────────
+        // ── Opt-in perf bench harness (feedBack#226) ──────────────────────
         // Enable with `?h3dbench=1` on the player URL. Aggregates per-segment
         // timings of update() into a console.log every _PB_REPORT_MS.
         //
@@ -5033,21 +6391,21 @@
             wrap.setAttribute('data-h3d-primary', '');
             highwayCanvas.parentNode.insertBefore(wrap, highwayCanvas.nextSibling);
 
-            // Subscribe to highway:visibility (slopsmith#246) so the
-            // .h3d-wrap overlay hides in sync with the slopsmith canvas.
+            // Subscribe to highway:visibility (feedBack#246) so the
+            // .h3d-wrap overlay hides in sync with the feedBack canvas.
             // The wrap is a sibling of #highway, so display:none on
             // #highway leaves us painting full-screen otherwise.
             // Guarded lazy bind: tolerate hosts that don't yet expose
-            // slopsmith.on/off (older slopsmith versions, headless
+            // feedBack.on/off (older feedBack versions, headless
             // tests).
-            if (window.slopsmith
-                && typeof window.slopsmith.on === 'function'
-                && typeof window.slopsmith.off === 'function') {
+            if (window.feedBack
+                && typeof window.feedBack.on === 'function'
+                && typeof window.feedBack.off === 'function') {
                 _visibilityHandler = (e) => {
                     if (!wrap) return;
                     // Filter by canvas identity (splitscreen-safe).
                     // Each createHighway() instance emits its own
-                    // visibility events on the shared slopsmith bus —
+                    // visibility events on the shared feedBack bus —
                     // without this gate, one hidden panel would also
                     // hide every other panel's 3D overlay.
                     if (!e || !e.detail || e.detail.canvas !== highwayCanvas) return;
@@ -5055,7 +6413,7 @@
                     wrap.style.display = v === false ? 'none' : '';
                 };
                 try {
-                    window.slopsmith.on('highway:visibility', _visibilityHandler);
+                    window.feedBack.on('highway:visibility', _visibilityHandler);
                 } catch (e) {
                     _visibilityHandler = null;
                 }
@@ -5076,7 +6434,7 @@
                     }
                 };
                 try {
-                    window.slopsmith.on('highway:canvas-replaced', _canvasReplacedHandler);
+                    window.feedBack.on('highway:canvas-replaced', _canvasReplacedHandler);
                 } catch (e) {
                     _canvasReplacedHandler = null;
                 }
@@ -5103,9 +6461,9 @@
             // steers GPU selection to the dGPU; on single-dGPU desktops it
             // requests the high-performance power profile. (It does not by
             // itself force NVIDIA's utilisation-driven clock ramp on Linux.)
-            ren = new T.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+            ren = new T.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', alpha: true });
             _probe = new T.Vector3();
-            ren.setClearColor(0x101820);
+            ren.setClearColor(0x101820, _bcActive() ? 0 : 1);
             wrap.appendChild(ren.domElement);
 
             lyricsCanvas = document.createElement('canvas');
@@ -5116,17 +6474,30 @@
             scene = new T.Scene();
             scene.fog = new T.Fog(0x101820, FOG_START * 0.8, FOG_END * 1.2);
 
-            cam = new T.PerspectiveCamera(70, 1, 0.01, FOG_END * 3);
+            cam = new T.PerspectiveCamera(BASE_VFOV, 1, 0.01, FOG_END * 3);
 
             ambLight = new T.AmbientLight(0xffffff, 0.85);
             scene.add(ambLight);
             dirLight = new T.DirectionalLight(0xffffff, 0.8);
             dirLight.position.set(40 * K, 120 * K, 80 * K);
             scene.add(dirLight);
+            _applyCinematic();
 
             fretG = new T.Group(); scene.add(fretG);
             tuningLblG = new T.Group(); scene.add(tuningLblG);
             noteG = new T.Group(); scene.add(noteG);
+            // Hit sparks (#3): a pooled additive Points cloud; a small burst fires at a
+            // gem on a verified hit (spawned in the verdict block, advanced in the render loop).
+            _sparkPos = new Float32Array(_SPARK_N * 3); _sparkCol = new Float32Array(_SPARK_N * 3);
+            _sparkVel = new Float32Array(_SPARK_N * 3); _sparkLife = new Float32Array(_SPARK_N);
+            {
+                const sg = new T.BufferGeometry();
+                sg.setAttribute('position', new T.BufferAttribute(_sparkPos, 3).setUsage(T.DynamicDrawUsage));
+                sg.setAttribute('color', new T.BufferAttribute(_sparkCol, 3).setUsage(T.DynamicDrawUsage));
+                const sm = new T.PointsMaterial({ size: 1.0 * K, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false, blending: T.AdditiveBlending, sizeAttenuation: true });
+                _sparkPts = new T.Points(sg, sm); _sparkPts.frustumCulled = false; _sparkPts.renderOrder = 8;
+                scene.add(_sparkPts);
+            }
             beatG = new T.Group(); scene.add(beatG);
             lblG = new T.Group(); scene.add(lblG);
 
@@ -5345,6 +6716,13 @@
                 transparent: true, opacity: 1.0, depthWrite: false,
             }));
             mHitBrightArrays = mHitBright.map(m => [m, m, m, m, mEdgeTransparent, mEdgeTransparent]);
+            // Readability (#2 / charrette): the note gems + their outlines punch THROUGH
+            // the distance fog so upcoming notes stay legible as they render in at the
+            // horizon. The board, lane, sustains and background scenery keep their
+            // atmospheric fog — only the note-defining materials are exempted, so the
+            // highway still reads as deep while the notes never dissolve into the haze.
+            [mWhiteOutline, mMissOutline].forEach(m => { if (m) m.fog = false; });
+            [mStr, mGlow, mStrHitOutline, mHitBright].forEach(arr => arr && arr.forEach(m => { if (m) m.fog = false; }));
             // Outline materials render at a lower renderOrder than the body.
             // The body is rendered on top with opacity:1 on hit/miss, which
             // fully covers the outline center — only the fringe that extends
@@ -6095,6 +7473,14 @@
                 _nfl.material.depthTest = false;
                 return _nfl;
             });
+            // Teaching marks fg/sd labels (§6.2.2). One pool, two get()s per note
+            // (finger + degree); the texture is swapped per draw via material.map.
+            pTeachMarkLbl = pool(lblG, () => {
+                const _tml = new T.Sprite(txtMat('0', '#7fd1ff', false, 'teachMark').clone());
+                _tml.material.fog = false;
+                _tml.material.depthTest = false;
+                return _tml;
+            });
             pConnectorLine = pool(noteG, () => new T.Line(
                 new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
                 new T.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.5, depthTest: false }),
@@ -6122,7 +7508,7 @@
                 return _sp;
             });
 
-            // ── Pre-warm pools (slopsmith#226) ─────────────────────────────
+            // ── Pre-warm pools (feedBack#226) ─────────────────────────────
             // Dense 7/8-string charts can outrun the lazy-grow path in the
             // first 1-2s of playback, stalling those frames with `new T.Mesh`
             // allocations *and* growing noteG forever (the pool only hides on
@@ -6153,6 +7539,7 @@
             pSusRailBloom.warm(_WARM_CHORD);
             pTechPlane.warm(_WARM_CHORD);
             pNoteFretLabel.warm(_WARM_NOTE);
+            pTeachMarkLbl.warm(_WARM_NOTE);
             pChordFrameFill.warm(_WARM_CHORD);
             pChordBox.warm(_WARM_CHORD);
             pChordLbl.warm(_WARM_CHORD);
@@ -6171,6 +7558,11 @@
 
             _bgLoadSettings();
             buildBoard();
+            // Apply the scene color theme now that settings + board exist. Sets
+            // the clear color + fog tint (board plane was themed in buildBoard).
+            // For the default theme this is identical to the hardcoded values
+            // initScene seeded above, so nothing changes for existing users.
+            _applyBgTheme();
 
             // Background animations (#13). Read settings keyed by this
             // panel and mount the active style's meshes. Subscribe to
@@ -6197,6 +7589,15 @@
             scene.add(bgGroup);
             _bgMountStyle();
             _bgListener = (changedKey) => {
+                if (changedKey === 'fretSpacing') {
+                    // _h3dFretUniform + the fretX-derived scalars were already
+                    // updated globally in h3dSetFretSpacing. Rebuild this
+                    // panel's static board geometry (fret wires, lanes, inlays)
+                    // so it re-lays-out for the new spacing; per-frame note
+                    // geometry reads fretX live and needs no rebuild.
+                    if (fretG) buildBoard();
+                    return;
+                }
                 if (changedKey === 'inlayLabelsVisible') {
                     _bgLoadSettings();
                     // Flip visibility on the already-built sprites; no
@@ -6277,6 +7678,17 @@
                     _bgLoadSettings();
                     if (fretG) buildBoard();
                     if (bgStyleId === 'lights') _bgRebuild();
+                    return;
+                }
+                if (changedKey === 'bgTheme' || changedKey === 'hwTheme') {
+                    // A scene-color axis changed (background = bgTheme:
+                    // clear+fog; highway = hwTheme: board plane + lane). Recolor
+                    // in place — no mesh rebuild needed (the board plane material
+                    // is mutated via _boardPlaneMat, the lane via mLaneOdd/Even).
+                    // _applyBgTheme reapplies both axes from their own keys, so
+                    // changing one dropdown retints only its half.
+                    _bgLoadSettings();
+                    _applyBgTheme();
                     return;
                 }
                 if (changedKey === 'customImageDataUrl') {
@@ -6368,7 +7780,7 @@
                         color: '#66c7ff',
                     });
                 }
-                return { s: note.s, f: note.f, noteTime: d.noteTime, labels };
+                return { s: note.s, f: note.f, noteTime: d.noteTime, labels, timingState: d.timingState || null };
             };
             const _ndPushMark = (arr, d) => {
                 const mark = _ndNormalizeMark(d);
@@ -6401,13 +7813,13 @@
             _ndOnMiss = (e) => { _ndMissMarks = _ndPushMark(_ndMissMarks, e.detail); };
             window.addEventListener('notedetect:hit', _ndOnHit);
             window.addEventListener('notedetect:miss', _ndOnMiss);
-            if (window.slopsmith &&
-                    typeof window.slopsmith.on  === 'function' &&
-                    typeof window.slopsmith.off === 'function') {
+            if (window.feedBack &&
+                    typeof window.feedBack.on  === 'function' &&
+                    typeof window.feedBack.off === 'function') {
                 _ndOnBusHit  = (e) => { _ndHitMarks  = _ndPushMark(_ndHitMarks,  e.detail); };
                 _ndOnBusMiss = (e) => { _ndMissMarks = _ndPushMark(_ndMissMarks, e.detail); };
-                window.slopsmith.on('note:hit', _ndOnBusHit);
-                window.slopsmith.on('note:miss', _ndOnBusMiss);
+                window.feedBack.on('note:hit', _ndOnBusHit);
+                window.feedBack.on('note:miss', _ndOnBusMiss);
             }
 
             // Score FX (notedetect ≥1.13). notedetect dispatches each fx
@@ -6441,10 +7853,10 @@
                 }, 0);
             };
             window.addEventListener('notedetect:fx', _fxOnFx);
-            if (window.slopsmith && typeof window.slopsmith.on === 'function'
-                    && typeof window.slopsmith.off === 'function') {
+            if (window.feedBack && typeof window.feedBack.on === 'function'
+                    && typeof window.feedBack.off === 'function') {
                 _fxOnSkin = () => _fxResolvePalette();
-                window.slopsmith.on('notedetect:skin', _fxOnSkin);
+                window.feedBack.on('notedetect:skin', _fxOnSkin);
             }
 
             return true;
@@ -6460,6 +7872,7 @@
             // setting without writing it back. Re-applied here so it sticks across
             // setting reloads.
             if (_bgReactiveOptOut) bgReactive = false;
+            if (bgStyleId === 'butterchurn') bgReactive = false; // Butterchurn owns the <audio> tap
             const newPaletteId = _bgReadSetting(panelKey, 'palette');
             let newPalette;
             if (newPaletteId === 'custom') {
@@ -6485,6 +7898,25 @@
                 _bgPaletteSig = newSig;
                 _applyPaletteToMaterials();
             }
+            bgThemeId = _bgReadSetting(panelKey, 'bgTheme');
+            // Highway axis. ONE-TIME BACKWARD-COMPAT BACKFILL: the first time we
+            // load with no stored hwTheme (pre-split installs, or anyone who only
+            // ever touched the old single "Scene colors" control), seed hwTheme
+            // FROM the background pick AND PERSIST it, so an existing 'cathode'
+            // selection looks byte-identical right after the upgrade. Persisting
+            // immediately (rather than re-inheriting on every read) is what keeps
+            // the two axes truly INDEPENDENT thereafter: once hwTheme is stored,
+            // changing the Background dropdown no longer drags the Highway
+            // surface along, and the settings UI's Highway value can never
+            // disagree with what's rendered. Written without _bgEmitChange so the
+            // backfill can't re-enter the change listener.
+            if (_bgHasStored(panelKey, 'hwTheme')) {
+                hwThemeId = _bgReadSetting(panelKey, 'hwTheme');
+            } else {
+                hwThemeId = bgThemeId;
+                _bgMemFallback.hwTheme = String(bgThemeId);
+                try { localStorage.setItem('h3d_bg_hwTheme', String(bgThemeId)); } catch (_) { /* storage blocked — mem fallback still seeds the read */ }
+            }
             showFretOnNote = _bgReadSetting(panelKey, 'showFretOnNote');
             fretNumberGhostScope = _bgReadSetting(panelKey, 'fretNumberGhostScope');
             cameraSmoothing = _bgReadSetting(panelKey, 'cameraSmoothing');
@@ -6504,6 +7936,14 @@
             textSize             = _bgReadSetting(panelKey, 'textSize');
             vibrancy             = _bgReadSetting(panelKey, 'vibrancy');
             glowMul              = _bgReadSetting(panelKey, 'glow');
+            _hitFx               = _bgReadSetting(panelKey, 'hitFx');
+            _sparks              = _bgReadSetting(panelKey, 'sparks');
+            _cinematic           = _bgReadSetting(panelKey, 'cinematic');
+            _verdictMarks        = _bgReadSetting(panelKey, 'verdictMarks');
+            _timingFx            = _bgReadSetting(panelKey, 'timingFx');
+            _streakFx            = _bgReadSetting(panelKey, 'streakFx');
+            _bloom               = _bgReadSetting(panelKey, 'bloom');
+            _applyCinematic();
             fpsVisible           = _bgReadSetting(panelKey, 'fpsVisible');
             fretDividersVisible  = _bgReadSetting(panelKey, 'fretDividersVisible');
             chordDiagramVisible  = _bgReadSetting(panelKey, 'chordDiagramVisible');
@@ -6758,6 +8198,31 @@
         function _bgEffectiveStyleId() {
             return _venueSceneOverride ? 'venue' : bgStyleId;
         }
+        // The 'butterchurn' bg-style renders a WebGL MilkDrop canvas BEHIND a
+        // transparent highway via the self-contained _bc* controller (top of file),
+        // NOT a Three.js fog-scenery style (its scenery falls back to 'off'). Mount
+        // is idempotent and driven by the bg-style dropdown through _bgMountStyle.
+        function _bcActive() { return bgStyleId === 'butterchurn'; }
+        function _bcSyncMode() {
+            if (_bcActive()) {
+                // Recreate when there's no controller, or the last one died during
+                // async init (lib/WebGL failure) — a dead controller self-cleaned,
+                // so retry here instead of leaving the style permanently broken.
+                if ((!bcCtrl || (bcCtrl.dead && bcCtrl.dead())) && wrap) {
+                    if (bcCtrl) bcCtrl = null;
+                    // audioProvider reuses this instance's shared analyser (the
+                    // fog scenery's #audio / stems tap) so the browser path never
+                    // opens a second createMediaElementSource on #audio.
+                    try { bcCtrl = _bcCreateController(wrap, () => canvasSize(highwayCanvas), () => { try { return _bgGetAnalyser(); } catch (e) { return null; } }); }
+                    catch (e) { console.warn('[3D-Hwy] Butterchurn init failed', e); }
+                }
+                if (ren) ren.setClearColor(0x101820, 0); // transparent so the visualizer shows through
+            } else if (bcCtrl) {
+                try { bcCtrl.destroy(); } catch (e) {}
+                bcCtrl = null;
+                _applyBgTheme(); // restore the opaque themed clear
+            }
+        }
         function _bgMountStyle() {
             const effectiveId = _bgEffectiveStyleId();
             const style = BG_STYLES[effectiveId] || BG_STYLES.off;
@@ -6793,6 +8258,7 @@
             bgStage = stage;
             bgState = result;
             bgMountedStyleId = effectiveId;
+            _bcSyncMode();
         }
         function _bgUnmountStyle() {
             const mountedId = bgMountedStyleId || _bgEffectiveStyleId();
@@ -6855,15 +8321,57 @@
                 scene.fog.color.setHex(0x080c12);
                 scene.fog.near = FOG_START * 0.98;
                 scene.fog.far = FOG_END * 0.98;
-                if (ren) ren.setClearColor(0x080c12);
+                // Keep the clear transparent while Butterchurn is active so the
+                // venue scene doesn't occlude the visualizer behind the highway.
+                if (ren) ren.setClearColor(0x080c12, _bcActive() ? 0 : 1);
                 if (ambLight) ambLight.intensity = 0.68;
             } else {
-                scene.fog.color.setHex(0x101820);
+                // Restore the user's scene-color theme (clear + fog) rather than
+                // the old hardcoded gray, so deactivating venue doesn't wipe a
+                // chosen background theme. _applyBgTheme reads the current theme.
                 scene.fog.near = FOG_START * 0.8;
                 scene.fog.far = FOG_END * 1.2;
-                if (ren) ren.setClearColor(0x101820);
                 if (ambLight) ambLight.intensity = 0.85;
+                _applyBgTheme();
             }
+        }
+
+        // Apply BOTH scene-color axes, each from its own setting key:
+        //   • BACKGROUND (bgThemeId): the WebGL clear color + the distance-fog
+        //     tint. Skipped while the venue scene is active (venue owns those —
+        //     see _bgApplyVenueSceneFog).
+        //   • HIGHWAY (hwThemeId): the fretboard/highway-surface plane + the lit
+        //     highway lane strip (the bright quad under the gems) + its dimmer
+        //     alternating row. Always themed; venue doesn't touch them.
+        // The two axes are independent, so picking a different id in each mixes
+        // freely. Safe to call any time; called from initScene, buildBoard, and
+        // the scene-theme listener (so a live switch of EITHER dropdown retints
+        // only its half immediately).
+        //
+        // The lane fields are OPTIONAL on a highway theme: one that omits `lane`
+        // / `laneDim` falls back to the stock lit/dim lane hexes, so every
+        // existing/neutral highway theme stays byte-identical (default blue lane
+        // unchanged). Only colored highway themes opt into a coordinated lane.
+        function _applyBgTheme() {
+            // --- Background axis: clear + fog ---
+            const bg = _bgBackgroundColors(bgThemeId);
+            if (!_venueSceneOverride) {
+                if (scene && scene.fog) scene.fog.color.setHex(bg.fog);
+                if (ren) ren.setClearColor(bg.clear, _bcActive() ? 0 : 1);
+            }
+            // --- Highway axis: board plane + lane ---
+            const hw = _bgHighwayColors(hwThemeId);
+            if (_boardPlaneMat) _boardPlaneMat.color.setHex(hw.board);
+            // Lit lane strip + its dimmer alternating row. Fall back to the
+            // hardcoded stock lane colors when the highway theme omits them.
+            const laneLit = (typeof hw.lane === 'number') ? hw.lane : HWY_LANE_STRIPE_ODD_HEX;
+            const laneDim = (typeof hw.laneDim === 'number') ? hw.laneDim : HWY_LANE_STRIPE_EVEN_HEX;
+            if (mLaneOdd) mLaneOdd.color.setHex(laneLit);
+            if (mLaneEven) mLaneEven.color.setHex(laneDim);
+            // Keep the (otherwise vestigial) lane target color in sync with the
+            // lit lane so any future lane-blend consumer reads the themed value.
+            if (_laneTargetColor) _laneTargetColor.setHex(laneLit);
+            else _laneTargetColor = new T.Color(laneLit);
         }
 
         /* ── Fretboard (static geometry) ────────────────────────────────── */
@@ -6873,6 +8381,85 @@
                 ? hexStr.trim().toLowerCase()
                 : d;
             return parseInt(s.slice(1), 16);
+        }
+        // Cinematic lighting (#2): darken ambient so emissive gems have a dark
+        // surround to pop against; strengthen the key light for modelling.
+        // Toggle via the 'cinematic' setting so it's directly comparable.
+        function _applyCinematic() {
+            if (!ambLight || !dirLight) return;
+            ambLight.intensity = _cinematic ? 0.45 : 0.85;
+            dirLight.intensity = _cinematic ? 1.15 : 0.8;
+        }
+        // #5 early/late: tint the hit feedback by timing — on-time green, early cyan,
+        // late amber. Falls back to green when timing is unknown (pure-provider path).
+        function _timingHex(ts) {
+            if (!_timingFx || !ts || ts === 'OK') return 0x22ff88;
+            if (ts === 'EARLY') return 0x35d6ff;
+            if (ts === 'LATE')  return 0xffb84d;
+            return 0x22ff88;
+        }
+        function _sparkBurst(x, y, z, hex, count) {
+            if (!_sparkPts || count <= 0) return;
+            const r = ((hex >> 16) & 255) / 255, g = ((hex >> 8) & 255) / 255, b = (hex & 255) / 255;
+            let made = 0;
+            for (let i = 0; i < _SPARK_N && made < count; i++) {
+                if (_sparkLife[i] > 0) continue;
+                const j = i * 3, ang = Math.random() * Math.PI * 2, sp = (5 + Math.random() * 12) * K;
+                _sparkPos[j] = x; _sparkPos[j + 1] = y; _sparkPos[j + 2] = z;
+                _sparkVel[j] = Math.cos(ang) * sp; _sparkVel[j + 1] = (12 + Math.random() * 24) * K; _sparkVel[j + 2] = Math.sin(ang) * sp * 0.55;
+                _sparkCol[j] = r; _sparkCol[j + 1] = g; _sparkCol[j + 2] = b;
+                _sparkLife[i] = 0.30 + Math.random() * 0.16; made++;
+            }
+        }
+        function _sparkUpdate(dt) {
+            if (!_sparkPts) return;
+            const grav = 55 * K; let any = false;
+            for (let i = 0; i < _SPARK_N; i++) {
+                if (_sparkLife[i] <= 0) continue;
+                const j = i * 3;
+                _sparkLife[i] -= dt;
+                if (_sparkLife[i] <= 0) { _sparkCol[j] = _sparkCol[j + 1] = _sparkCol[j + 2] = 0; continue; }
+                any = true;
+                _sparkVel[j + 1] -= grav * dt;
+                _sparkPos[j] += _sparkVel[j] * dt; _sparkPos[j + 1] += _sparkVel[j + 1] * dt; _sparkPos[j + 2] += _sparkVel[j + 2] * dt;
+                const fade = 1 - Math.min(1, dt * 3.2);
+                _sparkCol[j] *= fade; _sparkCol[j + 1] *= fade; _sparkCol[j + 2] *= fade;
+            }
+            _sparkPts.geometry.attributes.position.needsUpdate = true;
+            _sparkPts.geometry.attributes.color.needsUpdate = true;
+            _sparkPts.visible = any;
+        }
+        // #4 Bloom: lazy-load the vendored postprocessing addons and build an
+        // EffectComposer (RenderPass -> UnrealBloomPass -> OutputPass/ACES). Returns
+        // the composer once ready, or null (caller falls back to a direct render).
+        function _bloomEnsure() {
+            if (_composer) return _composer;
+            if (_bloomLoad || !ren || !scene || !cam) return null;
+            const A = '/static/vendor/three/addons/';
+            _bloomLoad = Promise.all([
+                import(A + 'postprocessing/EffectComposer.js'),
+                import(A + 'postprocessing/RenderPass.js'),
+                import(A + 'postprocessing/UnrealBloomPass.js'),
+                import(A + 'postprocessing/OutputPass.js'),
+            ]).then(([EC, RP, UB, OP]) => {
+                try {
+                    const sz = canvasSize(highwayCanvas) || { w: 1280, h: 720 };
+                    const w = Math.max(2, sz.w | 0), h = Math.max(2, sz.h | 0);
+                    // Multisampled (WebGL2 MSAA) HalfFloat target so anti-aliasing
+                    // survives the bloom path — EffectComposer's default target has no
+                    // `samples`, which is why bloom-on looked jagged (worst on non-Retina
+                    // DPR1 displays that have no supersampling cushion).
+                    const _bloomRT = new T.WebGLRenderTarget(w, h, { type: T.HalfFloatType, samples: 4 });
+                    const comp = new EC.EffectComposer(ren, _bloomRT);
+                    comp.addPass(new RP.RenderPass(scene, cam));
+                    _bloomPass = new UB.UnrealBloomPass(new T.Vector2(w, h), 0.65, 0.5, 0.82); // strength, radius, threshold (high → only emissive blooms)
+                    comp.addPass(_bloomPass);
+                    comp.addPass(new OP.OutputPass());
+                    comp.setSize(w, h);
+                    _bloomW = w; _bloomH = h; _composer = comp;
+                } catch (e) { console.warn('[3D-Hwy] bloom init failed', e); _composer = null; }
+            }).catch((e) => console.warn('[3D-Hwy] bloom modules failed', e));
+            return null;
         }
         function buildBoard() {
             // Dispose before clearing (traverse: nut/headstock may live in a Group).
@@ -6909,7 +8496,12 @@
             // spawn horizon (-AHEAD * TS), so the far edge aligns with AHEAD.
             const blAhead = TS * AHEAD;
             const pg = new T.PlaneGeometry(bw, blAhead);
-            const pm = new T.MeshLambertMaterial({ color: 0x08080e, transparent: true, opacity: 0.6 });
+            // Board (highway-surface) color comes from the active HIGHWAY scene
+            // theme (default theme = the original 0x08080e). Kept on
+            // _boardPlaneMat so _applyBgTheme can recolor it live without
+            // rebuilding the board.
+            const pm = new T.MeshLambertMaterial({ color: _bgHighwayColors(hwThemeId).board, transparent: true, opacity: 0.6 });
+            _boardPlaneMat = pm;
             const p = new T.Mesh(pg, pm);
             p.rotation.x = -Math.PI / 2;
             p.position.set(board.center, S_BASE - NH / 2 - 2 * K, -blAhead / 2);
@@ -8257,7 +9849,7 @@
         function smoothNow(bundle) {
             const raw = bundle.currentTime;
             const p = performance.now();
-            // Host pause signal (slopsmith core's bundle.isPlaying): when the
+            // Host pause signal (feedBack core's bundle.isPlaying): when the
             // chart clock isn't advancing (paused / stalled / mid-seek), don't
             // extrapolate forward against a frozen audio sample — that creeps
             // the highway ahead by up to the interp cap and then snaps back
@@ -8353,6 +9945,7 @@
             if (pMuteXLines) pMuteXLines.reset();
             if (pFHXLines) pFHXLines.reset();
             pNoteFretLabel.reset(); pConnectorLine.reset(); pDropLine.reset();
+            pTeachMarkLbl.reset();
             pFretColMarker.reset(); pSusRail.reset(); pSusRailBloom.reset(); pTechPlane.reset();
             // Clear per-frame queues in-place (avoid reallocating the array object).
             _ndLabels.length = 0;
@@ -8378,7 +9971,7 @@
                     if (_ndMissMarks[_pi].expiresAt <= _ndFrameNowMs) _ndMissMarks.splice(_pi, 1);
                 }
             }
-            // slopsmith#254 — capture core's per-note judgment provider for
+            // feedBack#254 — capture core's per-note judgment provider for
             // this frame's drawNote() calls (held-sustain glow + lit gems).
             // bundle.getNoteState is ALWAYS present (the core stub returns
             // null when no provider is registered), so its existence isn't
@@ -8816,6 +10409,9 @@
 
             _drawNextByString = nextNoteByString;
             _drawChordTemplates = bundle.chordTemplates ?? null;
+            _drawTeachingMarks = !!bundle.teachingMarksVisible;
+            // Default on: only an explicit false (older bundles omit the flag) hides fg.
+            _showFingerHints = bundle.fingerHintsVisible !== false;
 
             // ── Recent-past event per string (for _nextAnyT deadline) ─────
             // Once a note/chord passes `now` it leaves _drawNextByString,
@@ -9078,10 +10674,10 @@
             {
                 const si = bundle.songInfo;
                 // bundle.songInfo has no filename field (the WS song_info message
-                // never includes it).  Use window.slopsmith.currentSong.filename
+                // never includes it).  Use window.feedBack.currentSong.filename
                 // — set by highway.js from the WS URL — combined with the
                 // arrangement index as a reliable per-song-arrangement key.
-                const currentSong = window.slopsmith && window.slopsmith.currentSong;
+                const currentSong = window.feedBack && window.feedBack.currentSong;
                 const key = currentSong ? currentSong.filename + '\0' + (si ? (si.arrangement_index ?? '') : '') : null;
                 if (key !== null && key !== _songKey) {
                     _songKey = key;
@@ -9667,7 +11263,7 @@
                         // lingering past that point.
                         chordTailHoldS = Math.min(CHORD_HWY_LINGER_S, Math.max(cjNext.t - ch.t, 1e-3));
                     }
-                    // slopsmith#254 — engine verdicts land ~0.4 s after the
+                    // feedBack#254 — engine verdicts land ~0.4 s after the
                     // chord crosses; on a fast different-voicing sequence
                     // the clip above can shrink the rim's draw life below
                     // that, so the green/red latch is set but the rim isn't
@@ -9823,6 +11419,19 @@
                             // so Object.assign leaves a stale `true` from a previous
                             // muted chord note untouched. Reset it explicitly here.
                             _scrChordNote.fhm = cn.fhm || false;
+                            // Same stale-scratch hazard for the bend shape:
+                            // `bnv`/`bt` are omit-when-default on the wire, so a
+                            // chord note without them would otherwise inherit the
+                            // previous note's curve (and bendSemisAtTime would
+                            // apply the wrong contour). Reset explicitly.
+                            _scrChordNote.bnv = Array.isArray(cn.bnv) ? cn.bnv : undefined;
+                            _scrChordNote.bt  = cn.bt || 0;
+                            // Same stale-scratch hazard for the teaching marks
+                            // (§6.2.2): fg/sd are omit-when-default on the wire,
+                            // so a chord note without them must reset to -1 or it
+                            // inherits the previous note's finger/degree label.
+                            _scrChordNote.fg  = Number.isInteger(cn.fg) ? cn.fg : -1;
+                            _scrChordNote.sd  = Number.isInteger(cn.sd) ? cn.sd : -1;
                             drawNote(
                                 _scrChordNote,
                                 now,
@@ -9967,7 +11576,7 @@
                         // Used for the mute X lines so hit/miss feedback only shows on
                         // the outer borders of the framebox, not inside the X pattern.
                         const baseRimHex = rimHex;
-                        // slopsmith#254 — once the chord crosses the hit
+                        // feedBack#254 — once the chord crosses the hit
                         // line, tint the teal frame by the note-state
                         // provider verdict: green on a clean grab, red on a
                         // miss. The verdict is async (the engine verifier
@@ -10260,6 +11869,40 @@
                                 yMaxF + lblHS / 2 - nameVertTuck,
                                 z);
                             lbl.scale.set(lblWS, lblHS, 1);
+                        }
+
+                        // Harmony annotations (§6.3.1 / §6.6) — the chord's
+                        // function (fn.rn Roman numeral) and template voicing,
+                        // stacked above the chord name. Gated by the
+                        // teaching-marks opt-in (mirrors the 2D overlay). Display
+                        // only — never grading.
+                        if (_drawTeachingMarks && firstInShapeRun && !chordWireHighDensity(ch)) {
+                            const _tmpl = bundle.chordTemplates?.[ch.id];
+                            const _h = chordHarmonyLabels(ch.fn, _tmpl?.voicing, _tmpl?.caged, _tmpl?.guideTones);
+                            if (_h.rn || _h.voicing || _h.caged || _h.guideTones) {
+                                const hlW = 24 * K * _textSizeMul;
+                                const hlH = 9 * K * _textSizeMul;
+                                const frameLeft = cx - width / 2;
+                                const baseX = frameLeft - hlW / 2 + NW * 0.94;
+                                const opacity = Math.min(1, 0.3 + fade * 0.7) * chordTailMul;
+                                // Start one chord-name-height above the name and
+                                // stack upward so labels never overlap the gems.
+                                let hy = yMaxF + hlH * 1.6;
+                                const _drawHarmony = (text, colorHex) => {
+                                    if (!text) return;
+                                    const s = pChordLbl.get();
+                                    const m = txtMat(text, colorHex, true, 'chord');
+                                    if (s.material.map !== m.map) { s.material.map = m.map; s.material.needsUpdate = true; }
+                                    s.material.opacity = opacity;
+                                    s.position.set(baseX, hy, z);
+                                    s.scale.set(hlW, hlH, 1);
+                                    hy += hlH;
+                                };
+                                _drawHarmony(_h.rn, '#ffcc66');         // sd teaching color
+                                _drawHarmony(_h.voicing, '#7fd1ff');    // fg teaching color
+                                _drawHarmony(_h.caged, '#a0ffa0');      // CAGED shape teaching color
+                                _drawHarmony(_h.guideTones, '#d0a0ff'); // guide-tone teaching color
+                            }
                         }
 
                         // Shape-based barre detection for the 3D indicator.
@@ -11309,15 +12952,71 @@
             return visualIdx >= (nStr - 1) * 0.5 ? -1 : 1;
         }
 
+        // Teaching marks (§6.2.2) — display only, never grading. Pure label
+        // helpers, mirroring static/highway.js so the two highways agree;
+        // node-tested via tests/js/highway_teaching_marks.test.js.
+        function teachingFingerLabel(fg) {
+            // fret-hand finger: '' when unset/out of range; 0 -> 'T' (thumb),
+            // 1..4 -> '1'..'4'.
+            if (!Number.isInteger(fg) || fg < 0 || fg > 4) return '';
+            return fg === 0 ? 'T' : String(fg);
+        }
+        function teachingDegreeLabel(sd) {
+            // scale degree: chromatic 0..11 above the active key tonic; '' when
+            // unset/out of range.
+            if (!Number.isInteger(sd) || sd < 0 || sd > 11) return '';
+            return String(sd);
+        }
+        /** Harmony annotations (§6.3.1 / §6.6): display labels for a chord's
+         * function (instance `fn.rn` Roman numeral) and template `voicing`,
+         * `caged` shape, and `guideTones`. '' for each when absent/malformed;
+         * `caged`/`guideTones` come back pre-formatted ("CAGED: E" / "gt 4,10").
+         * Pure; shared with the 2D highway and node-tested. Display only — never
+         * grading. */
+        function chordHarmonyLabels(fn, voicing, caged, guideTones) {
+            const rn = (fn && typeof fn.rn === 'string') ? fn.rn.trim() : '';
+            const vc = (typeof voicing === 'string') ? voicing.trim() : '';
+            const cg = (typeof caged === 'string' && /^[CAGED]$/.test(caged.trim()))
+                ? 'CAGED: ' + caged.trim() : '';
+            const gt = Array.isArray(guideTones)
+                ? guideTones.filter(n => Number.isInteger(n) && n >= 0 && n <= 11) : [];
+            return { rn, voicing: vc, caged: cg, guideTones: gt.length ? 'gt ' + gt.join(',') : '' };
+        }
+
+        function bnvSampleAt(bnv, t) {
+            // Linear interpolation of a bend curve [{t, v}] (§6.2.1; t is
+            // seconds from the note onset) at elapsed time t. Clamps to the
+            // endpoints; returns 0 for an empty/invalid curve.
+            if (!Array.isArray(bnv) || bnv.length === 0) return 0;
+            if (t <= bnv[0].t) return bnv[0].v;
+            const last = bnv[bnv.length - 1];
+            if (t >= last.t) return last.v;
+            for (let i = 1; i < bnv.length; i++) {
+                const a = bnv[i - 1], b = bnv[i];
+                if (t <= b.t) {
+                    const span = b.t - a.t;
+                    return span > 0 ? a.v + (b.v - a.v) * ((t - a.t) / span) : b.v;
+                }
+            }
+            return last.v;
+        }
+
         function bendSemisAtTime(n, chartTime) {
+            if (!(n?.sus > 0)) return 0;
+            // When the note carries an authoritative bend curve (§6.2.1),
+            // sample its real shape at the elapsed time so the gem's Y gesture
+            // and sustain ribbon follow the actual bend (pre-bend, round-trip,
+            // release, …). Negative samples clamp to 0 (upward-only Y offset).
+            if (Array.isArray(n.bnv) && n.bnv.length) {
+                return Math.max(0, bnvSampleAt(n.bnv, chartTime - n.t));
+            }
             const bn = Number(n?.bn) || 0;
-            if (!(bn > 0) || !(n?.sus > 0)) return 0;
+            if (!(bn > 0)) return 0;
             const p = Math.max(0, Math.min(1, (chartTime - n.t) / Math.max(n.sus, 1e-6)));
-            // rise → hold → release: ramp up over the first ~35 %, hold, then
-            // release back down over the last ~30 %. Depicts the bend gesture
-            // (up and back down) rather than a monotone climb that only ever
-            // showed the bend going up. Drives both the sustain ribbon's Y
-            // contour and the gem's techniqueYNow offset.
+            // Fallback: synthesize rise → hold → release from the scalar peak.
+            // Ramp up over the first ~35 %, hold, then release over the last
+            // ~30 % — the bend gesture rather than a monotone climb. Drives both
+            // the sustain ribbon's Y contour and the gem's techniqueYNow offset.
             const RISE = BEND_ENV_RISE_FRAC, REL = BEND_ENV_RELEASE_FRAC;
             let env;
             if (p < RISE) env = p / RISE;
@@ -11558,10 +13257,11 @@
             const effectiveProjWin = _rawGap > 0 ? Math.min(0.6, Math.max(0.05, _rawGap)) : 0.6;
             const projFactorG = Math.max(0, Math.min(1, 1 - Math.max(dt, 0) / effectiveProjWin));
             const inGhostWin = n.f > 0 && isNextOnString && dt > -ghostHold && dt < effectiveProjWin && projFactorG > 0.001;
-            // slopsmith#254 — query the provider once per note, before both !skipBody
+            // feedBack#254 — query the provider once per note, before both !skipBody
             // blocks, so _showHit can be a const and _ndGood is available for the
             // sustain trail (which renders even when skipBody=true for slide targets).
             let _ndGood = false;    // true when provider confirms hit/active
+            let _hitPunch = 1;      // #3 per-gem scale-punch on a fresh hit
             let _ndState = null;    // 'hit'|'active'|'miss'|null; null → fall back to proximity heuristic
             let _ndCs = null;       // raw provider response — truthy when provider returned a verdict
             let _ndCsIsObj = false; // typeof _ndCs === 'object'
@@ -11733,16 +13433,31 @@
                 const rimXY = n.ac ? ACCENT_RIM_XY_SCALE_MUL : 1;
                 const rimZ = n.ac ? ACCENT_RIM_Z_SCALE_MUL : 1;
 
-                // slopsmith#254 — apply outline + lateral face-fill overrides from provider verdict.
+                // feedBack#254 — apply outline + lateral face-fill overrides from provider verdict.
                 // hit/active → green outline (mHitBright[s]) + green lateral faces;
                 // miss → magenta-red outline (mMissOutline) + dark lateral faces; front/back stay transparent.
                 if (_ndCs) {
+                    const _vAlpha = (_ndCsIsObj && typeof _ndCs.alpha === 'number') ? _ndCs.alpha : 1;
                     if (_ndState === 'miss') {
                         _ndOutline = mMissOutline;
                         _ndFaceMat = mMissEdgeArrays;
+                        _streakHits = 0;            // #7 break the streak (heat eases down)
+                        if (_verdictMarks) _ndLabels.push({ x, y: y + NH * 1.7, z: noteZ + 0.02, labels: [{ text: '✗', color: '#ff5a7a' }] });  // #6
                     } else if (_ndGood) {
                         _ndOutline = mHitBright[s] ?? mGlow[s];
                         _ndFaceMat = mHitBrightArrays[s] ?? null;
+                        _hitPunch = 1 + 0.22 * _hitFx * _vAlpha;   // #3 scale-punch (biggest at strike, eases)
+                        if (_verdictMarks) { const _tc = _timingHex(_ndMatchedMark && _ndMatchedMark.timingState); _ndLabels.push({ x, y: y + NH * 1.7, z: noteZ + 0.02, labels: [{ text: '✓', color: '#' + _tc.toString(16).padStart(6, '0') }] }); }  // #6 + #5
+                        if (_sparks && _hitFx > 0 && _vAlpha > 0.5) {
+                            const _spk = s + '|' + n.f + '|' + n.t.toFixed(2);
+                            if (!(_sparkSeen.get(_spk) > now)) {
+                                _sparkSeen.set(_spk, now + 1.0);
+                                if (_sparkSeen.size > 600) _sparkSeen.clear();
+                                _streakHits++;
+                                const _heatMul = _streakFx ? (1 + 0.85 * _streakHeat) : 1;   // #7 escalate
+                                _sparkBurst(x, y, noteZ, _timingHex(_ndMatchedMark && _ndMatchedMark.timingState), Math.round((4 + 7 * _hitFx) * _heatMul));
+                            }
+                        }
                     }
                 }
 
@@ -11855,6 +13570,7 @@
                 } else {
                     core.scale.set(rimXY, rimXY, 2.5 * rimZ);
                 }
+                if (_hitPunch !== 1) core.scale.multiplyScalar(_hitPunch);   // #3 hit scale-punch
                 // Fret digits on fretted (n.f > 0) flying notes deliberately
                 // omitted: the showFretOnNote setting and its UI helper text
                 // promise digits on the fretboard ghost only, never on the
@@ -11917,6 +13633,7 @@
                         const ribbonSusTrail = !!(
                             (slideSt && n.f > 0 && (n.sus || 0) > 1e-4)
                             || (Number(n.bn) > 0)
+                            || (Array.isArray(n.bnv) && n.bnv.length > 0)
                             || n.tr
                             || hasTechniqueVibrato
                         );
@@ -12087,11 +13804,17 @@
                         arrow.material.opacity = 1;
                     }
                 }
-                if (n.bn > 0) {
+                // Derive the peak from bn OR the bnv curve: a note may carry an
+                // authoritative curve with bn left at 0 (bn SHOULD be the peak
+                // whenever bnv exists — this is the robustness fallback).
+                const _bnvPeak = (Array.isArray(n.bnv) && n.bnv.length)
+                    ? n.bnv.reduce((m, p) => Math.max(m, Number(p.v) || 0), 0) : 0;
+                const _bendPeak = Math.max(Number(n.bn) || 0, _bnvPeak);
+                if (_bendPeak > 0) {
                     // Bend chevron stack — PlaneGeometry mesh so it tilts with
                     // the gem (approachRot). Fixed world size so it perspective-
                     // shrinks naturally without distFactor compensation.
-                    const steps = Math.max(1, Math.min(4, Math.round(n.bn)));
+                    const steps = Math.max(1, Math.min(4, Math.round(_bendPeak)));
                     const bendSm = bendChevronMat(steps, activePalette[s] || 0xffffff);
                     const l = pTechPlane.get();
                     l.material = _spriteMat2MeshMat(l, bendSm);
@@ -12220,6 +13943,35 @@
                         const flS = 7.0 * K * (1 + 0.4 * Math.max(0, dt) / AHEAD) * _textSizeMul * fretLabelScaleForFret(n.f);
                         fretLabel.scale.set(flS, flS, 1);
                         fretLabel.material.opacity = alpha;
+                    }
+
+                    // Teaching marks (§6.2.2) — display only, never grading. The
+                    // fret-hand finger (fg) renders by default to the right of the
+                    // fret label (hideable via the finger-hints toggle); the scale
+                    // degree (sd) is opt-in (mirrors the 2D `teachingMarksVisible`
+                    // toggle) and renders to the left.
+                    if (alpha > 0 && n.f > 0) {
+                        const _tmS = 5.0 * K * _textSizeMul * fretLabelScaleForFret(n.f);
+                        const _drawTeachMark = (text, colorHex, dx, cacheKey) => {
+                            if (!text) return;
+                            const spr = pTeachMarkLbl.get();
+                            const m = txtMat(text, colorHex, false, cacheKey);
+                            if (spr.material.map !== m.map) {
+                                spr.material.map = m.map;
+                                spr.material.needsUpdate = true;
+                            }
+                            spr.position.set(x + dx, labelY, noteZ);
+                            spr.renderOrder = renderOrderForLayerAtZ(noteZ,
+                                _isArpNote ? 'ARP_NOTE_FRET_LABEL' : 'NOTE_FRET_LABEL');
+                            spr.scale.set(_tmS, _tmS, 1);
+                            spr.material.opacity = alpha;
+                        };
+                        if (_showFingerHints) {
+                            _drawTeachMark(teachingFingerLabel(n.fg), '#7fd1ff', NW * 0.95, 'teachFg');
+                        }
+                        if (_drawTeachingMarks) {
+                            _drawTeachMark(teachingDegreeLabel(n.sd), '#ffcc66', -NW * 0.95, 'teachSd');
+                        }
                     }
                 }
             }
@@ -12661,13 +14413,92 @@
             ctx.restore();
         }
 
+        // Horizontal-FOV-hold ("Hor+"). Returns the vertical fov (deg) the
+        // camera should use for the given pane aspect. With the bridge off (or
+        // absent), or at/under the start aspect, it returns the base vertical
+        // fov unchanged — an exact no-op, so normal panes render identically to
+        // before. Past the start aspect it lowers the vertical fov to keep the
+        // horizontal cone ~constant, so the neck fills an ultra-wide pane
+        // instead of collapsing into a central sliver. Pure + finite-guarded.
+        function effectiveVfov(aspect, tune) {
+            const base = (tune && Number.isFinite(tune.baseVfov)) ? tune.baseVfov : BASE_VFOV;
+            if (!tune || !tune.enabled || !Number.isFinite(aspect) || aspect <= 0) return base;
+            const start = (Number.isFinite(tune.startAspect) && tune.startAspect > 0)
+                ? tune.startAspect : HORPLUS_START_ASPECT;
+            if (aspect <= start) return base;
+            const floor = Number.isFinite(tune.minVfovDeg) ? tune.minVfovDeg : HORPLUS_MIN_VFOV;
+            const DEG = Math.PI / 180;
+            // Held horizontal fov: explicit hfovDeg if given, else the horizontal
+            // cone the base vertical fov produces at the start aspect.
+            const hfov = (Number.isFinite(tune.hfovDeg) && tune.hfovDeg > 0)
+                ? tune.hfovDeg * DEG
+                : 2 * Math.atan(Math.tan(base * DEG / 2) * start);
+            // Vertical fov that reproduces that horizontal cone at this aspect.
+            let vfov = 2 * Math.atan(Math.tan(hfov / 2) / aspect) / DEG;
+            const blend = Number.isFinite(tune.blend) ? Math.max(0, Math.min(1, tune.blend)) : 1;
+            vfov = base + (vfov - base) * blend;            // 0 = base, 1 = full Hor+
+            if (!Number.isFinite(vfov)) return base;
+            return Math.max(floor, Math.min(base, vfov));
+        }
+
         /* ── Camera smooth lerp ──────────────────────────────────────────── */
         function camUpdate(bundle) {
             const bpm = computeBPM(bundle.beats, bundle.currentTime);
             const lerp = CAM_LERP_BASE * Math.max(bpm, 60) / 120;
 
+            // ── Horizontal-FOV-hold + optional wide-pane pose nudges ──
+            // Driven by window.__h3dAspectTune (default off → exact no-op).
+            // _resolveTuneFor(paneKey) returns the shared base with THIS pane's
+            // overrides (if any) laid on top, so a single split pane can be framed
+            // independently. The base is seeded from defaults + localStorage on
+            // first read, so a persisted tuning session applies on load without
+            // opening the panel. Every field is finite-coerced. When disabled (or
+            // splitOnly and not in a split) the tune is treated as null, so
+            // effectiveVfov returns the base vertical fov and cam.fov is restored
+            // to it. The fov write is guarded on an actual change so a steady pane
+            // costs nothing.
+            const _paneKey = _aspectPaneKey(
+                bundle && bundle.songInfo && bundle.songInfo.arrangement, _paneUid);
+            // Only feed the Target-picker registry while the tuner is open (same
+            // gate as the readout). Closed → nothing is registered, so the registry
+            // can't grow for users who never open the panel; the key is still
+            // resolved below so any saved overrides keep applying.
+            if (window.__h3dAspectPanelOpen) _aspectRegisterPane(_paneKey);
+            const _aspTune = _resolveTuneFor(_paneKey);
+            const _aspActive = !!(_aspTune && _aspTune.enabled
+                && !(_aspTune.splitOnly && !_ssActive()));
+            const _tune = _aspActive ? _aspTune : null;
+            const _vfov = effectiveVfov(_paneAspect, _tune);
+            if (Number.isFinite(_vfov) && Math.abs(_vfov - cam.fov) > 1e-4) {
+                cam.fov = _vfov;
+                cam.updateProjectionMatrix();
+            }
+            // Publish a per-pane live readout for the tuner panel (only while it's
+            // open, so the steady path stays allocation-free). Keyed by pane so
+            // the panel can show the reading for whichever target is selected.
+            if (window.__h3dAspectPanelOpen) {
+                const _ro = window.__h3dAspectReadout || (window.__h3dAspectReadout = {});
+                const _slot = _ro[_paneKey] || (_ro[_paneKey] = {});
+                _slot.aspect = _paneAspect; _slot.vfov = _vfov;
+                _ro.__last = _paneKey;
+            }
+            // Optional pose nudges (height / dolly / pitch) to chase a low-flat
+            // wide-pane look if fov alone isn't enough. Gated to wide panes and
+            // suppressed while the Camera Director owns the view (it wins).
+            const _startAspect = (_tune && Number.isFinite(_tune.startAspect) && _tune.startAspect > 0)
+                ? _tune.startAspect : HORPLUS_START_ASPECT;
+            const _dirActive = !!(window.__h3dCamCtl && window.__h3dCamCtl.enabled);
+            const _wide = !!(_tune && _paneAspect > _startAspect) && !_dirActive;
+            const _poseHMul = (_wide && Number.isFinite(_tune.heightMul)) ? _tune.heightMul : 1;
+            const _poseDMul = (_wide && Number.isFinite(_tune.distMul)) ? _tune.distMul : 1;
+            const _poseLookYAdd = (_wide && Number.isFinite(_tune.pitchAdd)) ? _tune.pitchAdd * K : 0;
+            const _poseLookZMul = (_wide && Number.isFinite(_tune.lookDepthMul) && _tune.lookDepthMul > 0)
+                ? _tune.lookDepthMul : 1;
+
             curX += (tgtX - curX) * lerp;
-            curDist += (tgtDist - curDist) * lerp;
+            // The fret-row fit guard (end of camUpdate) may dolly the camera back
+            // via _fretRowFitBoost; the span-driven tgtDist still owns zooming IN.
+            curDist += (tgtDist * _fretRowFitBoost - curDist) * lerp;
             const dist = curDist * aspectScale;
             const h = CAM_H_BASE * (dist / CAM_DIST_BASE);
 
@@ -12679,6 +14510,9 @@
             const _dMul = CAM_FRAME_D_NEAR + (CAM_FRAME_D_FAR - CAM_FRAME_D_NEAR) * _zt;
             const shoulderOffset = (_leftyCached ? -1 : 1) * 10 * K;
             let _camX = curX + shoulderOffset, _camY = h * _hMul, _camZ = dist * _dMul;
+            // Optional wide-pane pose nudges (default identity → no-op).
+            if (_poseHMul !== 1) _camY *= _poseHMul;
+            if (_poseDMul !== 1) _camZ *= _poseDMul;
             // ── Free-camera user tweaks (orbit / height / zoom / pan) ──
             // Driven by the Camera Director plugin via window.__h3dCamCtl.
             // Layered ON TOP of the auto-framing so note tracking still works.
@@ -12687,7 +14521,7 @@
             // finite number before use so a malformed object can never feed NaN
             // into cam.position / cam.lookAt.
             const _freeCam = window.__h3dCamCtl;
-            const _lookAtZ = -FOCUS_D * 0.35;
+            const _lookAtZ = -FOCUS_D * 0.35 * _poseLookZMul;
             if (_freeCam && _freeCam.enabled) {
                 const _distMul = Number.isFinite(_freeCam.distMul) ? _freeCam.distMul : 1;
                 const _heightMul = Number.isFinite(_freeCam.heightMul) ? _freeCam.heightMul : 1;
@@ -12708,7 +14542,7 @@
             // This lets the camera adapt to any panel aspect ratio automatically.
             const fretMidY = (sY(0) + sY(nStr - 1)) / 2;
             _probe.set(curX, fretMidY, 0);                  // play-line fretboard centre
-            cam.lookAt(curX, curLookY, -FOCUS_D * 0.35);    // tentative look — needed for project()
+            cam.lookAt(curX, curLookY + _poseLookYAdd, _lookAtZ);    // tentative look — needed for project()
             cam.updateMatrixWorld();
             _probe.project(cam);                             // _probe.y → NDC in [-1, 1]
 
@@ -12737,7 +14571,39 @@
                 const _pitch = Number.isFinite(_freeCam.pitch) ? _freeCam.pitch : 0;
                 cam.lookAt(curX + _panX * K, curLookY + (_pitch + _panY) * K, _lookAtZ);
             } else {
-                cam.lookAt(curX, curLookY, _lookAtZ);
+                cam.lookAt(curX, curLookY + _poseLookYAdd, _lookAtZ);
+            }
+
+            // ── Fret-row fit guard ────────────────────────────────────────────
+            // Project the fret-number-row band (just below the lowest string, at
+            // the play line) with the final camera. If it sits below the safe
+            // bottom line, dolly back (raise _fretRowFitBoost → applied to the
+            // curDist lerp target next frame) until it clears; relax lazily once
+            // there's comfortable headroom. Asymmetric + deadbanded so it
+            // converges without hunting, and capped so the zoom can't pop. It
+            // cooperates with the tilt loop above rather than fighting it: pulling
+            // back shrinks the scene, the tilt loop keeps the board centre anchored
+            // at DESIRED_NDC_Y, so only the row's bottom headroom changes. Skipped
+            // while the free-cam (Camera Director) owns the view.
+            if (_freeCam && _freeCam.enabled) {
+                if (_fretRowFitBoost !== 1) _fretRowFitBoost = 1;
+            } else {
+                cam.updateMatrixWorld();
+                const _rowY = Math.min(sY(0), sY(nStr - 1)) - S_GAP * 1.4;
+                _probe.set(curX, _rowY, 0.5 * K);
+                _probe.project(cam);                              // _probe.y → NDC; < -1 = off the bottom
+                const _rowNdcY = _probe.y;
+                if (_rowNdcY < FRET_ROW_FIT_NDC_MIN) {
+                    // Row below the safe line → pull back promptly, proportional to
+                    // the deficit so it converges in a few frames without overshoot.
+                    const _need = FRET_ROW_FIT_NDC_MIN - _rowNdcY;
+                    _fretRowFitBoost = Math.min(FRET_ROW_FIT_BOOST_MAX,
+                        _fretRowFitBoost + Math.min(0.05, _need * 0.4));
+                } else if (_rowNdcY > FRET_ROW_FIT_NDC_MIN + FRET_ROW_FIT_DEADBAND
+                           && _fretRowFitBoost > 1) {
+                    // Comfortable headroom → relax the dolly back toward normal, lazily.
+                    _fretRowFitBoost = Math.max(1, _fretRowFitBoost - 0.01);
+                }
             }
         }
 
@@ -12748,12 +14614,64 @@
             const baseDPR = _ssActive() ? Math.min(devicePixelRatio, 1.25) : Math.min(devicePixelRatio, 2);
             ren.setPixelRatio(_renderScale * baseDPR);
             ren.setSize(w, h);
-            wrap.style.height = h + 'px';
+            // Pin the overlay to #highway's exact box so it fully covers the
+            // canvas. The wrap is anchored to top:0/left:0/right:0 of its
+            // offset parent, which only lines up with #highway when the
+            // canvas sits at the parent's origin. The v3 player can place
+            // chrome above the canvas, shifting the wrap up so its lower edge
+            // falls short of #highway — leaving a strip of the canvas exposed
+            // (the reported gap, where the previous renderer's frame showed
+            // through). The wrap is a sibling of highwayCanvas, so they share
+            // an offset parent; tracking the canvas's box keeps the overlay
+            // flush in single-player and splitscreen alike.
+            //
+            // Derive the box from the SAME getBoundingClientRect measurements
+            // that drive ren.setSize(w, h) — NOT integer offsetTop/Width — so
+            // the overlay matches the renderer exactly. Under browser zoom or
+            // fractional flex layouts the canvas lands on sub-pixel bounds;
+            // offsetWidth/Top round to whole pixels and would leave the wrap up
+            // to 1px short of (or shifted from) the canvas, reopening the
+            // exposed edge strip. Position is taken relative to the containing
+            // block's padding edge (clientTop/Left strip the parent's border),
+            // which is what `top`/`left` resolve against for the absolutely
+            // positioned wrap. Guarded on a laid-out canvas (offsetWidth/Height
+            // > 0); otherwise fall back to the static top:0/left:0/right:0.
+            if (highwayCanvas && highwayCanvas.offsetWidth > 0 && highwayCanvas.offsetHeight > 0) {
+                const _pinParent = wrap.offsetParent || highwayCanvas.parentNode;
+                const _cr = highwayCanvas.getBoundingClientRect();
+                const _pr = _pinParent ? _pinParent.getBoundingClientRect() : { top: 0, left: 0 };
+                const _pbTop = _pinParent ? _pinParent.clientTop : 0;
+                const _pbLeft = _pinParent ? _pinParent.clientLeft : 0;
+                wrap.style.top = (_cr.top - _pr.top - _pbTop) + 'px';
+                wrap.style.left = (_cr.left - _pr.left - _pbLeft) + 'px';
+                wrap.style.right = 'auto';
+                wrap.style.width = _cr.width + 'px';
+                wrap.style.height = _cr.height + 'px';
+                _wrapPinned = true;
+            } else {
+                // Canvas not laid out (e.g. init ran before #highway had a real
+                // box, or a panel hide/show where canvasSize() falls back to the
+                // parent panel). Reset to the static anchor — if we had pinned
+                // before, the old top/left/right:auto/width would otherwise stay
+                // and the wrap would reappear at a stale horizontal position on
+                // the next show. Leave _wrapPinned false so the rAF loop re-pins
+                // once the canvas materializes again.
+                wrap.style.top = '0';
+                wrap.style.left = '0';
+                wrap.style.right = '0';
+                wrap.style.width = 'auto';
+                wrap.style.height = h + 'px';
+                _wrapPinned = false;
+            }
             if (lyricsCanvas) { lyricsCanvas.width = w; lyricsCanvas.height = h; }
             _diagRenderCache.clear();
             cam.aspect = w / h;
             cam.updateProjectionMatrix();
             aspectScale = Math.max(1, REF_ASPECT / Math.max(cam.aspect, 0.5));
+            // Cache the pane aspect for the horizontal-FOV-hold in camUpdate.
+            // cam.fov itself is owned by camUpdate (not set here) so live
+            // __h3dAspectTune edits apply every frame without a resize.
+            _paneAspect = cam.aspect;
             _appliedW = w; _appliedH = h;
         }
 
@@ -12770,15 +14688,15 @@
             if (_ndOnHit) { window.removeEventListener('notedetect:hit', _ndOnHit); _ndOnHit = null; }
             if (_ndOnMiss) { window.removeEventListener('notedetect:miss', _ndOnMiss); _ndOnMiss = null; }
             if (_fxOnFx) { window.removeEventListener('notedetect:fx', _fxOnFx); _fxOnFx = null; }
-            if (window.slopsmith && typeof window.slopsmith.off === 'function') {
-                if (_fxOnSkin) { try { window.slopsmith.off('notedetect:skin', _fxOnSkin); } catch (e) {} _fxOnSkin = null; }
-                if (_ndOnBusHit)  window.slopsmith.off('note:hit', _ndOnBusHit);
-                if (_ndOnBusMiss) window.slopsmith.off('note:miss', _ndOnBusMiss);
+            if (window.feedBack && typeof window.feedBack.off === 'function') {
+                if (_fxOnSkin) { try { window.feedBack.off('notedetect:skin', _fxOnSkin); } catch (e) {} _fxOnSkin = null; }
+                if (_ndOnBusHit)  window.feedBack.off('note:hit', _ndOnBusHit);
+                if (_ndOnBusMiss) window.feedBack.off('note:miss', _ndOnBusMiss);
                 if (_visibilityHandler) {
-                    try { window.slopsmith.off('highway:visibility', _visibilityHandler); } catch (e) {}
+                    try { window.feedBack.off('highway:visibility', _visibilityHandler); } catch (e) {}
                 }
                 if (_canvasReplacedHandler) {
-                    try { window.slopsmith.off('highway:canvas-replaced', _canvasReplacedHandler); } catch (e) {}
+                    try { window.feedBack.off('highway:canvas-replaced', _canvasReplacedHandler); } catch (e) {}
                 }
             }
             _ndOnBusHit = _ndOnBusMiss = null;
@@ -12795,6 +14713,7 @@
             _fxElemSeen = new WeakSet();
             _fxRingMs = _fxBreakMs = -1e9;
             _chordVerdicts = new Map();
+            if (bcCtrl) { try { bcCtrl.destroy(); } catch (e) {} bcCtrl = null; }
             _bgUnmountStyle();
             bgGroup = null; _bgLastT = 0;
             _diagChord = null; _diagPrev = null; _diagPrevOpacity = 0; _diagPrevStartOpacity = 0; _diagPrevStartT = null;
@@ -12904,10 +14823,12 @@
             for (const g of _ownedSharedGeos) g?.dispose?.();
             _ownedSharedGeos.length = 0;
             txtCache = {};
+            if (_sparkPts) { try { _sparkPts.geometry.dispose(); _sparkPts.material.dispose(); } catch (e) {} _sparkPts = null; }
+            if (_composer) { try { _composer.dispose(); if (_bloomPass && _bloomPass.dispose) _bloomPass.dispose(); } catch (e) {} _composer = null; _bloomPass = null; }
             if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = tuningLblG = null;
             ambLight = dirLight = null;
-            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; _accentShellsByString = []; mWhiteOutline = mSusOutline = null; mMissOutline = null; mHitSusOutline = null; stringLines = []; stringLineGlows = []; fretWireMats = []; fretTubeGeo?.dispose?.(); fretTubeGeo = null;
+            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; _accentShellsByString = []; mWhiteOutline = mSusOutline = null; mMissOutline = null; mHitSusOutline = null; stringLines = []; stringLineGlows = []; _boardPlaneMat = null; fretWireMats = []; fretTubeGeo?.dispose?.(); fretTubeGeo = null;
             for (const m of _inlayMats) m?.dispose?.(); _inlayMats = []; _inlayLabels = [];
             // mTapChevron: dispose explicitly — if no tap marker ever
             // spawned a pooled mesh, the scene.traverse() pass above never
@@ -12934,7 +14855,7 @@
             _renderScale = 1;
             mBeatM = mBeatQ = null;
             pNote = pNoteEdge = pSus = pSusOutline = pSusRibbon = pSusRibbonOl = pLbl = pBeat = pSec = null;
-            pFretLbl = pLane = pLaneDivider = pGhostFretLbl = pChordBox = pChordFrameFill = pChordLbl = pBarreLine = pArpBracket = pNoteFretLabel = pConnectorLine = pDropLine = pTapChevron = pAccentHalo = pHaloBar = pPMXFill = pFHXFill = pMuteXLines = pFHXLines = null;
+            pFretLbl = pLane = pLaneDivider = pGhostFretLbl = pChordBox = pChordFrameFill = pChordLbl = pBarreLine = pArpBracket = pNoteFretLabel = pConnectorLine = pDropLine = pTapChevron = pAccentHalo = pHaloBar = pPMXFill = pFHXFill = pMuteXLines = pFHXLines = pTeachMarkLbl = null;
             if (gPMXFill) { gPMXFill.dispose(); gPMXFill = null; }
             if (gFHXFill) { gFHXFill.dispose(); gFHXFill = null; }
             if (gPMXLines) { gPMXLines.dispose(); gPMXLines = null; }
@@ -12944,7 +14865,7 @@
             pFretColMarker = null;
             _fretMarkerWaveCache.clear();
             gNote = gSus = gBeat = gTapChevron = null;
-            tgtX = curX = xFretMid(CAM_LOCK_CENTER_FRET); tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR; _oobStringWarned = false;
+            tgtX = curX = xFretMid(CAM_LOCK_CENTER_FRET); tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; _fretRowFitBoost = 1; nStr = NSTR; _oobStringWarned = false;
             _lookaheadCamX = xFretMid(CAM_LOCK_CENTER_FRET);
             _lookaheadFretSpan = DEFAULT_LOOKAHEAD_FRET_SPAN;
             _lookaheadCamPrevNow = null;
@@ -12994,6 +14915,8 @@
                 }
                 _destroyed = _isReady = false;
                 _isFocused = true;
+                if (!_paneUid) _paneUid = ++_aspectPaneCounter;   // fallback pane id (no-arrangement panes)
+                _registerTunerShortcut();   // session-global tuner shortcut (self-guarded)
                 const myToken = ++_initToken;
                 highwayCanvas = canvas;
                 _invertedCached = !!(bundle && bundle.inverted);
@@ -13012,11 +14935,11 @@
                 _bgReactiveOptOut = !!(bundle && bundle.bgReactive === false);
 
                 if (_ssActive()) {
-                    window.slopsmithSplitscreen.onFocusChange(_onFocusChange);
+                    window.feedBackSplitscreen.onFocusChange(_onFocusChange);
                     _focusSubscribed = true;
                 }
 
-                // Async-ready contract (slopsmith#36 readyPromise). Resolves
+                // Async-ready contract (feedBack#36 readyPromise). Resolves
                 // when Three.js loaded + scene initialised (_isReady = true).
                 // Rejects on any async failure so highway.js can revert.
                 let _resolveReady, _rejectReady;
@@ -13127,6 +15050,17 @@
                     } else if (box.w > 0 && box.h > 0 &&
                             (Math.abs(box.w - _appliedW) > 1 || Math.abs(box.h - _appliedH) > 1)) {
                         applySize(box.w, box.h);
+                    } else if (!_wrapPinned && box.w > 0 && box.h > 0 &&
+                            highwayCanvas.offsetWidth > 0 && highwayCanvas.offsetHeight > 0) {
+                        //  3. The overlay pin couldn't be applied at init because
+                        //     #highway had no layout yet (offsetWidth/Height === 0),
+                        //     so applySize() only set the wrap height. The canvas has
+                        //     now laid out but to the same logical size, so neither
+                        //     drift branch above fires — re-run applySize to pin the
+                        //     wrap to the canvas box now that its offsets are real.
+                        //     Otherwise the overlay stays at top:0;left:0;right:0 and
+                        //     a strip of #highway is exposed on first load / split.
+                        applySize(box.w, box.h);
                     }
                 }
                 update(bundle);
@@ -13147,7 +15081,98 @@
                     }
                 }
 
-                pbBeg(6); ren.render(scene, cam); pbEnd(6);
+                // Browser: the shared analyser can change between songs (a sloppak
+                // stems swap replaces it, often on a new context) — or may not have
+                // existed when the controller mounted. Keep the visualizer bound to
+                // the LIVE analyser by comparing against what the controller
+                // actually bound (boundAnalyser()), not a separately-tracked guess:
+                // cheap reconnect when it's the same context, full controller
+                // rebuild when the context changed (cross-context connectAudio is
+                // impossible). Only act once the viz is ready (ready()), so we
+                // don't thrash a controller that's still loading async. Done before
+                // the render block so a rebuild this frame just skips one bc frame
+                // (bcCtrl goes null) without affecting the highway's own render.
+                if (bcCtrl && !_bcIsDesktop() && bcCtrl.ready && bcCtrl.ready()) {
+                    let a = null;
+                    try { a = _bgGetAnalyser(); } catch (e) { a = null; }
+                    const an = a && a.analyser;
+                    const bound = bcCtrl.boundAnalyser ? bcCtrl.boundAnalyser() : null;
+                    if (an && an !== bound) {
+                        if (!(bcCtrl.reconnectAudio && bcCtrl.reconnectAudio(a))) {
+                            // Context changed (or reconnect failed) — rebuild via the
+                            // proven destroy/create paths so the new context binds.
+                            try { bcCtrl.destroy(); } catch (e) {}
+                            bcCtrl = null;
+                            _bcSyncMode();
+                        }
+                    }
+                }
+                if (bcCtrl) {
+                    const cfg = _bcLoadSettings();
+                    const _ct = bundle.currentTime || 0;
+                    if (cfg.chartAccents) {
+                        if (_ct < _chartPrevT - 0.08 || _ct - _chartPrevT > 1.0) {
+                            _bcBeatIdx = _bcFfIdx(bundle.beats, _ct, 'time');
+                            _bcNoteIdx = _bcFfIdx(bundle.notes, _ct, 't');
+                            _bcChordIdx = _bcFfIdx(bundle.chords, _ct, 't');
+                        }
+                        const _beats = bundle.beats || [];
+                        while (_bcBeatIdx < _beats.length && _beats[_bcBeatIdx].time <= _ct) {
+                            const strong = _beats[_bcBeatIdx].measure !== undefined && _beats[_bcBeatIdx].measure !== -1;
+                            _chartEnv = Math.max(_chartEnv, strong ? 1.0 : 0.6);
+                            _bcBeatIdx++;
+                        }
+                        const _notes = bundle.notes || [];
+                        let _tintS = -1;
+                        while (_bcNoteIdx < _notes.length && _notes[_bcNoteIdx].t <= _ct) {
+                            _chartEnv = Math.max(_chartEnv, 0.6);
+                            _tintS = _notes[_bcNoteIdx].s;
+                            _bcNoteIdx++;
+                        }
+                        const _chords = bundle.chords || [];
+                        while (_bcChordIdx < _chords.length && _chords[_bcChordIdx].t <= _ct) {
+                            _chartEnv = Math.max(_chartEnv, 0.95);
+                            _bcChordIdx++;
+                        }
+                        if (_tintS >= 0 && activePalette && activePalette.length) {
+                            _bcTintTarget = activePalette[((_tintS % activePalette.length) + activePalette.length) % activePalette.length];
+                        }
+                        _chartPrevT = _ct;
+                        _chartEnv *= 0.86;
+                        bcCtrl.chart(_chartEnv * (cfg.chartStrength != null ? cfg.chartStrength : 1));
+                    } else {
+                        bcCtrl.chart(0);
+                    }
+                    if (cfg.colorTint && _bcTintTarget != null) {
+                        const tr = (_bcTintTarget >> 16) & 255, tg = (_bcTintTarget >> 8) & 255, tb = _bcTintTarget & 255;
+                        _tintR += (tr - _tintR) * 0.06; _tintG += (tg - _tintG) * 0.06; _tintB += (tb - _tintB) * 0.06;
+                        bcCtrl.tint((Math.round(_tintR) << 16) | (Math.round(_tintG) << 8) | Math.round(_tintB), cfg.tintStrength != null ? cfg.tintStrength : 0.65);
+                    } else {
+                        bcCtrl.tint(null, 0);
+                    }
+                    bcCtrl.render();
+                }
+                {
+                    const _jNow = performance.now();
+                    const _jdt = _juiceLastT === 0 ? 1 / 60 : Math.min(0.05, (_jNow - _juiceLastT) / 1000);
+                    _juiceLastT = _jNow;
+                    _sparkUpdate(_jdt);
+                    _streakHeat += (Math.min(1, _streakHits / 16) - _streakHeat) * 0.08;   // #7 ease heat
+                }
+                {
+                    const comp = (_bloom && !_ssActive()) ? _bloomEnsure() : null;
+                    if (comp) {
+                        const bsz = canvasSize(highwayCanvas);
+                        if (bsz && bsz.w > 0 && bsz.h > 0 && (bsz.w !== _bloomW || bsz.h !== _bloomH)) {
+                            comp.setSize(bsz.w | 0, bsz.h | 0); _bloomW = bsz.w | 0; _bloomH = bsz.h | 0;
+                        }
+                        if (ren.toneMapping !== T.ACESFilmicToneMapping) ren.toneMapping = T.ACESFilmicToneMapping;
+                        pbBeg(6); comp.render(); pbEnd(6);
+                    } else {
+                        if (ren.toneMapping !== T.NoToneMapping) ren.toneMapping = T.NoToneMapping;
+                        pbBeg(6); ren.render(scene, cam); pbEnd(6);
+                    }
+                }
                 if (lyricsCtx && lyricsCanvas) {
                     lyricsCtx.clearRect(0, 0, lyricsCanvas.width, lyricsCanvas.height);
                     // Capture the actual lyrics-banner bottom so overlay cards
@@ -13201,7 +15226,13 @@
                         const _fpsBoxW = Math.ceil(_fpsMetrics.width) + _fpsPadX * 2;
                         const _fpsBoxH = 14 + _fpsPadY * 2;
                         const _fpsE = 8;
-                        const _fpsBaseY = Math.round(Math.max(_fpsE + H * 0.06, lyricsBottom + _fpsE));
+                        // Keep it top-right but below the v3 Up Next pill / live HUD
+                        // (whichever is showing) so the readout is never occluded.
+                        const _fpsBaseY = Math.round(Math.max(
+                            _fpsE + H * 0.06,
+                            lyricsBottom + _fpsE,
+                            _v3TopRightChromeBottom() + _fpsE,
+                        ));
                         const _fpsX = W - 8 - _fpsBoxW;
                         const _fpsY = _fpsBaseY + cornerStack['tr'];
                         lyricsCtx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -13304,17 +15335,20 @@
                 _destroyed = true; _isReady = false; _diagChord = null; _diagPrev = null; _diagLastKey = null; _diagRenderCache.clear();
                 _lastHwW = 0; _lastHwH = 0;
                 _appliedW = 0; _appliedH = 0;
+                _paneAspect = 0;
+                if (cam && cam.fov !== BASE_VFOV) { cam.fov = BASE_VFOV; cam.updateProjectionMatrix(); }
+                _wrapPinned = false;
                 _unsubscribeFocus(); teardown();
                 highwayCanvas = null;
             },
         };
     }
 
-    window.slopsmithViz_highway_3d = createFactory;
+    window.feedBackViz_highway_3d = createFactory;
     // Per-panel control descriptors (splitscreen). The palette selector was
     // removed — per-string colors are set via the core "Highway String Colors"
     // UI, which drives both highways by named string.
-    window.slopsmithViz_highway_3d.panelControls = [
+    window.feedBackViz_highway_3d.panelControls = [
         {
             key: 'cameraSmoothing',
             label: 'Camera smoothing (X-pan)',
@@ -13357,8 +15391,8 @@
     //                        are matched by the piano plugin instead.
     //                        _canRun3D() in app.js still gates Auto from
     //                        picking us on machines without WebGL2.
-    window.slopsmithViz_highway_3d.contextType = 'webgl2';
-    window.slopsmithViz_highway_3d.__test = {
+    window.feedBackViz_highway_3d.contextType = 'webgl2';
+    window.feedBackViz_highway_3d.__test = {
         getAnalyserForBridgeTest: _bgGetAnalyser,
         readBandsForBridgeTest: _bgReadBands,
         resetAnalyserBridgeForTest() { _bgBridgeKeys.clear(); _bgAudio = null; _bgAudioCore = null; _bgAudioFailedAt = 0; },
@@ -13369,12 +15403,12 @@
     // sloppaks). Word boundaries (\b) keep us from accidentally matching
     // arrangements that merely contain these as substrings (e.g. a
     // "BasslineKeys" arrangement would otherwise match `bass`).
-    window.slopsmithViz_highway_3d.matchesArrangement = function (songInfo) {
+    window.feedBackViz_highway_3d.matchesArrangement = function (songInfo) {
         const arr = (songInfo && songInfo.arrangement) || '';
         return /\b(?:lead|rhythm|bass|combo|guitar)\b/i.test(arr);
     };
 
-    // No imperative register() call needed: slopsmith#272 introduced the
+    // No imperative register() call needed: feedBack#272 introduced the
     // consolidated tour menu, which discovers this plugin's tour automatically
     // via /api/plugins (has_tour:true from plugin.json's tour field) and
     // gates relevance on whether highway_3d is the active viz. A register()

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def server(tmp_path, monkeypatch, isolate_logging):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     srv = importlib.import_module("server")
     try:
@@ -102,6 +102,40 @@ def test_recent_orders_by_last_played(client, server):
     assert "first.archive" in names
     # Rows carry metadata fields for the dashboard.
     assert "art_url" in recent[0] and "title" in recent[0]
+
+
+def test_top_orders_by_best_score_and_enriches(client, server):
+    # The profile "Your best scores" panel: top songs by best score, descending,
+    # joined to metadata. A worse-scored and a resume-only song must rank below /
+    # be excluded respectively.
+    server.meta_db.put("low.archive", 0, 0, {"title": "Low", "artist": "A"})
+    server.meta_db.put("high.archive", 0, 0, {"title": "High", "artist": "B"})
+    server.meta_db.put("resume.archive", 0, 0, {"title": "Resume"})
+    client.post("/api/stats", json={"filename": "low.archive", "score": 100, "accuracy": 0.5})
+    client.post("/api/stats", json={"filename": "high.archive", "score": 900, "accuracy": 0.95})
+    client.post("/api/stats", json={"filename": "resume.archive", "lastPlayPosition": 12.0})  # plays==0
+    top = client.get("/api/stats/top").json()
+    names = [r["filename"] for r in top]
+    assert names[:2] == ["high.archive", "low.archive"]   # best score first
+    assert "resume.archive" not in names                  # unscored excluded
+    assert top[0]["title"] == "High" and "art_url" in top[0]
+    assert top[0]["best_score"] == 900 and top[0]["best_accuracy"] == pytest.approx(0.95)
+
+
+def test_top_aggregates_arrangements_and_respects_limit(client, server):
+    # Per-song aggregation (best across arrangements) + the limit param.
+    server.meta_db.put("multi.archive", 0, 0, {"title": "Multi",
+                                               "arrangements": [{"name": "Lead"}, {"name": "Bass"}]})
+    server.meta_db.put("solo.archive", 0, 0, {"title": "Solo"})
+    client.post("/api/stats", json={"filename": "multi.archive", "arrangement": 0, "score": 200, "accuracy": 0.6})
+    client.post("/api/stats", json={"filename": "multi.archive", "arrangement": 1, "score": 800, "accuracy": 0.9})
+    client.post("/api/stats", json={"filename": "solo.archive", "score": 500, "accuracy": 0.7})
+    top = client.get("/api/stats/top").json()
+    multi = next(r for r in top if r["filename"] == "multi.archive")
+    assert multi["best_score"] == 800   # best arrangement, not summed/duplicated
+    assert [r["filename"] for r in top].count("multi.archive") == 1
+    # limit caps the list.
+    assert len(client.get("/api/stats/top?limit=1").json()) == 1
 
 
 # ── Codex-preflight regressions (bad-input hardening + resume touch) ──────────
@@ -303,6 +337,111 @@ def test_per_source_xp_reset_only_removes_that_source(client, server):
     prog = db.reset_source_xp("minigames")
     assert prog["xp"] == 100                       # only minigames removed
     assert db.reset_source_xp("minigames")["xp"] == 100   # idempotent
+
+
+def test_encoded_filename_canonicalized_on_write(client, server):
+    # The recorder POSTs URL-encoded filenames (encodeURIComponent: '/'→'%2F',
+    # ' '→'%20'), but `songs` keys on the decoded path. The write path must
+    # canonicalize so the recorded play surfaces in every read that filters on
+    # `filename IN songs` — the original "Your best scores reads empty" bug.
+    decoded = "sloppak/My Song_Band.archive"
+    encoded = "sloppak%2FMy%20Song_Band.archive"
+    server.meta_db.put(decoded, 0, 0, {"title": "My Song", "artist": "Band"})
+    r = client.post("/api/stats", json={"filename": encoded, "score": 700, "accuracy": 0.9})
+    assert r.status_code == 200
+    assert r.json()["stats"]["filename"] == decoded   # stored under the decoded key
+    # Surfaces in the profile panel, the library badge map and Jump-back-in.
+    assert decoded in [x["filename"] for x in client.get("/api/stats/top").json()]
+    assert decoded in client.get("/api/stats/best").json()
+    assert decoded in [x["filename"] for x in client.get("/api/stats/recent").json()]
+    # The per-song read (path param Starlette already decodes) agrees.
+    assert client.get("/api/stats/" + decoded).json()["plays"] == 1
+
+
+def test_encoded_filename_arrangement_is_bounded(client, server):
+    # Canonicalizing first also lets the arrangement-count bound resolve the real
+    # song, so a bad index is still rejected when posted under an encoded name.
+    server.meta_db.put("sloppak/Two Arr.archive", 0, 0,
+                       {"arrangements": [{"name": "Lead"}, {"name": "Bass"}]})
+    enc = "sloppak%2FTwo%20Arr.archive"
+    assert client.post("/api/stats", json={"filename": enc, "arrangement": 5,
+                                           "score": 10, "accuracy": 0.5}).status_code == 400
+    assert client.post("/api/stats", json={"filename": enc, "arrangement": 1,
+                                           "score": 10, "accuracy": 0.5}).status_code == 200
+
+
+def test_migration_decodes_and_merges_legacy_encoded_rows(client, server):
+    # Pre-fix rows were stored URL-encoded. The one-time migration must rewrite
+    # them to the decoded key AND merge any collision (best=max, plays=sum,
+    # last-wins) without violating the (filename, arrangement) PK.
+    db = server.meta_db
+    db.put("sloppak/Dup Song.archive", 0, 0, {"title": "Dup"})
+    # A legacy encoded row + an already-decoded row for the SAME song/arr.
+    db.conn.execute(
+        "INSERT INTO song_stats (filename, arrangement, plays, best_score, best_accuracy, "
+        "last_score, last_accuracy, last_position, last_played_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("sloppak%2FDup%20Song.archive", 0, 2, 500, 0.7, 500, 0.7, 0, "2025-01-01 00:00:00.000", "2025-01-01 00:00:00.000"))
+    db.conn.execute(
+        "INSERT INTO song_stats (filename, arrangement, plays, best_score, best_accuracy, "
+        "last_score, last_accuracy, last_position, last_played_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("sloppak/Dup Song.archive", 0, 1, 900, 0.95, 900, 0.95, 12.0, "2025-02-02 00:00:00.000", "2025-02-02 00:00:00.000"))
+    db.conn.commit()
+    db._migrate_decode_stat_filenames()
+    # Exactly one merged row under the decoded key.
+    rows = db.conn.execute(
+        "SELECT plays, best_score, best_accuracy, last_score, last_position FROM song_stats "
+        "WHERE filename = ?", ("sloppak/Dup Song.archive",)).fetchall()
+    assert len(rows) == 1
+    plays, best_score, best_acc, last_score, last_pos = rows[0]
+    assert plays == 3                         # summed
+    assert best_score == 900                  # max
+    assert best_acc == pytest.approx(0.95)    # max
+    assert last_score == 900 and last_pos == pytest.approx(12.0)  # newer (2025-02) wins
+    # No encoded ghost survives, and the row now shows up in the panel.
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM song_stats WHERE filename LIKE '%\\%2F%' ESCAPE '\\'").fetchone()[0] == 0
+    assert "sloppak/Dup Song.archive" in [x["filename"] for x in client.get("/api/stats/top").json()]
+    # Idempotent: a second run is a clean no-op.
+    db._migrate_decode_stat_filenames()
+    assert db.conn.execute("SELECT COUNT(*) FROM song_stats WHERE filename = ?",
+                           ("sloppak/Dup Song.archive",)).fetchone()[0] == 1
+
+
+def test_real_percent_filename_not_corrupted(client, server):
+    # A real on-disk song whose name legitimately contains "%20" must survive.
+    # The recorder encodeURIComponent's it (the literal '%' → '%25'), and the
+    # canonicalizer must resolve back to the REAL library key, not blindly
+    # unquote it into a different, non-existent name.
+    real = "sloppak/100%20Off_Band.archive"      # literal %20 in the on-disk name
+    server.meta_db.put(real, 0, 0, {"title": "100% Off"})
+    posted = "sloppak%2F100%2520Off_Band.archive"  # encodeURIComponent(real)
+    r = client.post("/api/stats", json={"filename": posted, "score": 300, "accuracy": 0.8})
+    assert r.status_code == 200
+    assert r.json()["stats"]["filename"] == real     # stored under the real key
+    assert real in [x["filename"] for x in client.get("/api/stats/top").json()]
+
+
+def test_migration_leaves_real_percent_and_orphan_rows_untouched(client, server):
+    # Migration must NOT rewrite a correctly-stored name that happens to contain
+    # %XX (it's a real library key), nor a dead-song orphan whose neither form is
+    # in the library.
+    db = server.meta_db
+    real = "sloppak/50%20Pct.archive"
+    db.put(real, 0, 0, {"title": "Real"})
+    for fn in (real, "ghost%2Fgone.archive"):     # real-% key + orphan (no songs row either way)
+        db.conn.execute(
+            "INSERT INTO song_stats (filename, arrangement, plays, best_score, best_accuracy, "
+            "last_score, last_accuracy, last_position, last_played_at, updated_at) "
+            "VALUES (?,0,1,100,0.5,100,0.5,0,'2025-01-01 00:00:00.000','2025-01-01 00:00:00.000')",
+            (fn,))
+    db.conn.commit()
+    db._migrate_decode_stat_filenames()
+    names = {r[0] for r in db.conn.execute("SELECT filename FROM song_stats").fetchall()}
+    assert real in names                          # real-% key preserved (not decoded away)
+    assert "ghost%2Fgone.archive" in names        # orphan left exactly as-is
+    assert "sloppak/50 Pct.archive" not in names  # never created the bogus decoded twin
 
 
 def test_award_xp_negative_reversal_clamps_at_zero(server):

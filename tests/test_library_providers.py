@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def server_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SKIP_STARTUP_TASKS", "1")
+    monkeypatch.setenv("FEEDBACK_SKIP_STARTUP_TASKS", "1")
     sys.modules.pop("server", None)
     mod = importlib.import_module("server")
     yield mod
@@ -213,7 +213,9 @@ def test_registered_provider_handles_library_endpoints(server_mod, client):
     assert stats["letters"] == {"R": 1}
     assert "page" not in provider.stats_kwargs
     assert "size" not in provider.stats_kwargs
-    assert "sort" not in provider.stats_kwargs
+    # `sort` is forwarded to query_stats now (the v3 jump rail keys its
+    # present-letter breakdown on the active sort column); defaults to "artist".
+    assert provider.stats_kwargs.get("sort") == "artist"
 
     tunings = client.get("/api/library/tuning-names", params={"provider": "remote:frodo"}).json()
     assert tunings["tunings"][0]["name"] == "E Standard"
@@ -276,7 +278,7 @@ def test_local_library_provider_cannot_be_replaced(server_mod):
 
 def test_library_provider_registration_is_available_to_plugins(tmp_path, monkeypatch):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("SLOPSMITH_SYNC_STARTUP", "1")
+    monkeypatch.setenv("FEEDBACK_SYNC_STARTUP", "1")
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
 

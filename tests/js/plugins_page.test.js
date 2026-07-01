@@ -21,7 +21,7 @@ const SRC = path.join(__dirname, '..', '..', 'static', 'v3', 'plugins-page.js');
 function loadPage(opts) {
     opts = opts || {};
     const store = opts.store || {};
-    const win = { slopsmith: null };
+    const win = { feedBack: null };
     win.localStorage = {
         getItem: (k) => (k in store ? store[k] : null),
         setItem: (k, v) => { if (opts.throwOnSet) throw new Error('quota'); store[k] = String(v); },
@@ -73,11 +73,15 @@ test('thumbUrl: manifest icon routes through the asset endpoint; else default', 
     assert.equal(t.thumbUrl({ id: 'x', icon: '' }), '/static/v3/pedal-default.svg');
 });
 
-test('settingsTarget: settings > screen > none', () => {
+test('settingsTarget: screen > settings > none', () => {
     const { t } = loadPage();
-    assert.deepEqual(t.settingsTarget({ id: 'a', has_settings: true, nav: true }), { kind: 'settings', id: 'a' });
+    // A screen wins even when the plugin also has settings (e.g. audio_engine):
+    // the pedal opens the plugin's page, not its settings panel.
+    assert.deepEqual(t.settingsTarget({ id: 'a', has_settings: true, nav: true }), { kind: 'screen', id: 'a' });
     assert.deepEqual(t.settingsTarget({ id: 'b', has_settings: false, nav: true }), { kind: 'screen', id: 'b' });
     assert.deepEqual(t.settingsTarget({ id: 'c', has_settings: false, has_screen: true }), { kind: 'screen', id: 'c' });
+    // Settings-only plugin (no screen) falls back to its settings panel.
+    assert.deepEqual(t.settingsTarget({ id: 'e', has_settings: true }), { kind: 'settings', id: 'e' });
     assert.deepEqual(t.settingsTarget({ id: 'd' }), { kind: 'none', id: 'd' });
 });
 

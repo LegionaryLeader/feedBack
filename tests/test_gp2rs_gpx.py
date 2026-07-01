@@ -21,6 +21,7 @@ from gp2rs_gpx import (
     _safe_filename_stem,
     _note_is_tie,
     _note_has_vibrato,
+    _beat_has_tremolo,
     _note_midi,
     _gpx_percussion_midis,
     _gpx_tuning,
@@ -31,6 +32,8 @@ from gp2rs_gpx import (
     _collect_tone_events,
     _inject_tones,
     _resolve_pending_slides,
+    _gpx_bend_shape,
+    _gpif_left_fingering,
 )
 from gp2rs import RsNote
 
@@ -53,6 +56,50 @@ def test_safe_filename_stem(name, expected):
     # Never contains a path separator or traversal segment.
     assert "/" not in out and "\\" not in out
     assert ".." not in out
+
+
+# ── _gpx_bend_shape (bn / bt / bnv, §6.2.1) ─────────────────────────────────
+
+def _bend_props(**vals):
+    """Build a GPIF property map {name: <Property> element} for the given
+    bend Float values, e.g. _bend_props(BendOriginValue=0, BendMiddleValue=100)."""
+    tp = {}
+    for name, num in vals.items():
+        tp[name] = ET.fromstring(
+            f'<Property name="{name}"><Float>{num}</Float></Property>')
+    return tp
+
+
+def test_gpx_bend_shape_round_trip_curve():
+    """origin/middle/destination value+offset → 3-point bnv; value/divisor=semis."""
+    tp = _bend_props(
+        BendOriginValue=0, BendOriginOffset=0,
+        BendMiddleValue=100, BendMiddleOffset1=50,   # 100/50 = 2 semitones
+        BendDestinationValue=0, BendDestinationOffset=100,
+    )
+    peak, intent, curve = _gpx_bend_shape(tp, divisor=50.0, sustain=1.0)
+    assert peak == 2.0
+    assert intent == 4   # round-trip (up then back down)
+    assert curve == [
+        {"t": 0.0, "v": 0.0}, {"t": 0.5, "v": 2.0}, {"t": 1.0, "v": 0.0}]
+
+
+def test_gpx_bend_shape_falls_back_to_even_spacing_without_offsets():
+    tp = _bend_props(BendOriginValue=0, BendDestinationValue=100)  # no offsets
+    peak, intent, curve = _gpx_bend_shape(tp, divisor=50.0, sustain=1.0)
+    assert peak == 2.0
+    assert intent == 0   # plain up
+    # origin defaults to 0%, destination to 100%.
+    assert curve == [{"t": 0.0, "v": 0.0}, {"t": 1.0, "v": 2.0}]
+
+
+def test_gpx_bend_shape_no_props_and_zero_length():
+    assert _gpx_bend_shape({}, divisor=50.0, sustain=1.0) == (0.0, 0, None)
+    # Peak + intent still derived for a zero-length note, but no curve.
+    peak, intent, curve = _gpx_bend_shape(
+        _bend_props(BendOriginValue=0, BendDestinationValue=100),
+        divisor=50.0, sustain=0.0)
+    assert peak == 2.0 and intent == 0 and curve is None
 
 
 # ── _decompress_bcfz / _parse_bcfs input guards ─────────────────────────────
@@ -512,6 +559,55 @@ def test_convert_file_gp8_ascending_tuning_not_mirrored(tmp_path, monkeypatch):
     assert (5, 0) in placed   # high-e open note on RS string 5
 
 
+# Beat 0 carries a beat-level <Tremolo>; beat 1 does not. End-to-end proof that
+# the picked beat's note serializes tremolo="1" and the other stays "0".
+_GPIF_GUITAR_TREMOLO = """
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Lead Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars>
+    <MasterBar><Time>4/4</Time><Bars>0</Bars></MasterBar>
+  </MasterBars>
+  <Bars>
+    <Bar id="0"><Voices>0</Voices></Bar>
+  </Bars>
+  <Voices>
+    <Voice id="0"><Beats>0 1</Beats></Voice>
+  </Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="r0"/><Tremolo>1/8</Tremolo><Notes>0</Notes></Beat>
+    <Beat id="1"><Rhythm ref="r0"/><Notes>1</Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0">
+      <Property name="String"><String>0</String></Property>
+      <Property name="Fret"><Fret>0</Fret></Property></Note>
+    <Note id="1">
+      <Property name="String"><String>5</String></Property>
+      <Property name="Fret"><Fret>0</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+def test_convert_file_gp8_tremolo_beat_flags_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif", lambda _p: ET.fromstring(_GPIF_GUITAR_TREMOLO))
+    out_files = convert_file(
+        "dummy.gp", str(tmp_path),
+        track_indices=[0], arrangement_names={0: "Lead"},
+    )
+    root = ET.parse(out_files[0]).getroot()
+    tremolo_by_string = {int(n.get("string")): n.get("tremolo")
+                         for n in root.iter() if n.tag == "note"}
+    # Beat 0 note (RS string 0) was tremolo-picked; beat 1 note (string 5) wasn't.
+    assert tremolo_by_string[0] == "1"
+    assert tremolo_by_string[5] == "0"
+
+
 def test_vocal_pitch_sidecar_sorts_multi_voice_by_time():
     # Two voices in one bar. Voice 0 (traversed first) emits its lyric note at
     # t=0.5 (a no-lyric quarter precedes it); voice 1 (traversed second) emits
@@ -686,6 +782,66 @@ def test_note_vibrato_ignores_whammy_trembar_property():
     assert _note_has_vibrato(n, tp) is False
 
 
+# ── _beat_has_tremolo (GP6/7/8 tremolo-picking import) ──────────────────────
+
+def test_beat_tremolo_direct_element():
+    # GPIF encodes tremolo picking as a direct <Tremolo>rate</Tremolo> child of
+    # <Beat> — the regression this fixes (GPX never read it). Rate-agnostic.
+    for rate in ("1/8", "1/16", "1/32"):
+        b = ET.fromstring(f'<Beat id="1"><Rhythm ref="1"/>'
+                          f'<Tremolo>{rate}</Tremolo></Beat>')
+        assert _beat_has_tremolo(b) is True
+
+
+def test_beat_tremolo_absent_is_false():
+    b = ET.fromstring('<Beat id="1"><Rhythm ref="1"/><Notes>1</Notes></Beat>')
+    assert _beat_has_tremolo(b) is False
+
+
+def test_beat_tremolo_is_direct_child_only():
+    # Matched as a direct child (not `.//`), so a <Tremolo> buried deeper must
+    # NOT trigger — guards against a false positive from unrelated nested markup.
+    b = ET.fromstring('<Beat id="1"><Properties>'
+                      '<Property name="X"><Tremolo>1/8</Tremolo></Property>'
+                      '</Properties></Beat>')
+    assert _beat_has_tremolo(b) is False
+
+
+def test_beat_tremolo_independent_of_whammy_trembar():
+    # VibratoWTremBar is the separate whammy-bar effect; a beat carrying only
+    # that (no <Tremolo>) is not tremolo picking.
+    b = ET.fromstring('<Beat id="1"><Properties>'
+                      '<Property name="VibratoWTremBar"><Strength>Slight</Strength></Property>'
+                      '</Properties></Beat>')
+    assert _beat_has_tremolo(b) is False
+
+
+# ── _gpif_left_fingering (GP7/GP8 per-note fret-hand finger -> fg) ───────────
+# GPIF stores a single note's fret-hand finger as a direct <LeftFingering>
+# child of <Note> (NOT a <Property>), with classical p-i-m-a-c letter codes —
+# verified against real GP8 exports (Open / I / M observed). Maps to the same
+# RS finger integers as the chord-diagram path (§6.2.2). Teaching mark only.
+
+@pytest.mark.parametrize("code, expected", [
+    ("Open", -1), ("P", 0), ("I", 1), ("M", 2), ("A", 3), ("C", 4),
+    ("i", 1), ("m", 2),                # case-insensitive
+    ("index", 1), ("ring", 3),         # word forms also accepted
+])
+def test_gpif_left_fingering_letter_codes(code, expected):
+    n = ET.fromstring(f'<Note id="1"><LeftFingering>{code}</LeftFingering>'
+                      '<Properties></Properties></Note>')
+    assert _gpif_left_fingering(n) == expected
+
+
+def test_gpif_left_fingering_absent_or_unknown_is_unset():
+    # No <LeftFingering> child, or an unrecognised value -> -1 (never fabricate).
+    assert _gpif_left_fingering(ET.fromstring('<Note id="1"/>')) == -1
+    assert _gpif_left_fingering(
+        ET.fromstring('<Note id="1"><LeftFingering>Z</LeftFingering></Note>')) == -1
+    assert _gpif_left_fingering(
+        ET.fromstring('<Note id="1"><LeftFingering></LeftFingering></Note>')) == -1
+
+
 # ── convert_file: GP8 chord-diagram name + fingering extraction (E3) ─────────
 # GP7/GP8 GPIF carries authored chord diagrams under a track's
 # Property[@name="DiagramCollection"]. Each Item gives the chord name and a
@@ -769,3 +925,237 @@ def test_convert_file_gp8_no_diagram_leaves_template_blank(tmp_path, monkeypatch
     assert [ct.get(f"finger{i}") for i in range(6)] == ["-1"] * 6
     # Fret pattern itself is unchanged (the join key still works).
     assert ct.get("fret0") == "3" and ct.get("fret1") == "2"
+
+
+# ── GP import correctness fixes (tester-reported) ───────────────────────────
+
+# Two guitar tracks, Rhythm listed BEFORE Lead. The importer used to name
+# arrangements purely by appearance order (first guitar -> "Lead"), which
+# swapped the roles for any file that lists Rhythm first.
+_GPIF_RHYTHM_BEFORE_LEAD = """
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Rhythm Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+    <Track id="1"><Name>Lead Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars><MasterBar><Time>4/4</Time><Bars>0 1</Bars></MasterBar></MasterBars>
+  <Bars>
+    <Bar id="0"><Voices>0</Voices></Bar>
+    <Bar id="1"><Voices>1</Voices></Bar>
+  </Bars>
+  <Voices>
+    <Voice id="0"><Beats>0</Beats></Voice>
+    <Voice id="1"><Beats>1</Beats></Voice>
+  </Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="r0"/><Notes>0</Notes></Beat>
+    <Beat id="1"><Rhythm ref="r0"/><Notes>1</Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+    <Note id="1"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+def test_convert_file_guitar_roles_follow_gp_name_not_order(tmp_path, monkeypatch):
+    # Editor path: track_indices but no arrangement_names → convert_file's
+    # fallback naming. The Rhythm track (listed first) must stay "Rhythm" and
+    # the Lead track "Lead" — not be swapped by appearance order.
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif",
+                        lambda _p: ET.fromstring(_GPIF_RHYTHM_BEFORE_LEAD))
+    out_files = convert_file("dummy.gp", str(tmp_path), track_indices=[0, 1])
+    names = [ET.parse(f).getroot().findtext("arrangement") for f in out_files]
+    assert names == ["Rhythm", "Lead"]
+
+
+def _gpif_bass(pitches: str) -> str:
+    return f"""
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Bass</Name>
+      <Property name="Tuning"><Pitches>{pitches}</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars><MasterBar><Time>4/4</Time><Bars>0</Bars></MasterBar></MasterBars>
+  <Bars><Bar id="0"><Voices>0</Voices></Bar></Bars>
+  <Voices><Voice id="0"><Beats>0</Beats></Voice></Voices>
+  <Beats><Beat id="0"><Rhythm ref="r0"/><Notes>0</Notes></Beat></Beats>
+  <Notes>
+    <Note id="0"><Property name="String"><String>0</String></Property>
+      <Property name="Fret"><Fret>0</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+@pytest.mark.parametrize("pitches,expected", [
+    ("28 33 38 43", 4),        # 4-string E-A-D-G
+    ("23 28 33 38 43", 5),     # 5-string low-B
+])
+def test_convert_file_bass_string_count_round_trips(tmp_path, monkeypatch, pitches, expected):
+    # The <tuning> element pads to 6 slots (RS2014 schema), which erased the
+    # 4-vs-5-string distinction. The serializer now records the real count in
+    # `stringCount`; parse_arrangement trims to it so a 5-string bass reports 5
+    # (was 4 → it rendered/played on 4 strings).
+    from song import parse_arrangement, arrangement_string_count
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif",
+                        lambda _p: ET.fromstring(_gpif_bass(pitches)))
+    out_files = convert_file("dummy.gp", str(tmp_path), track_indices=[0])
+    root = ET.parse(out_files[0]).getroot()
+    assert root.find("tuning").get("stringCount") == str(expected)
+    arr = parse_arrangement(out_files[0])
+    assert len(arr.tuning) == expected
+    assert arrangement_string_count(arr) == expected
+
+
+# A track with one normal note and one tie-DESTINATION note. The tie is folded
+# into the previous note's sustain, so it is not a separate RS note; the
+# importer's preview count must exclude it (matches the imported result).
+_GPIF_WITH_TIE = """
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Lead</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars><MasterBar><Time>4/4</Time><Bars>0</Bars></MasterBar></MasterBars>
+  <Bars><Bar id="0"><Voices>0</Voices></Bar></Bars>
+  <Voices><Voice id="0"><Beats>0 1</Beats></Voice></Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="r0"/><Notes>0</Notes></Beat>
+    <Beat id="1"><Rhythm ref="r0"/><Notes>1</Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>3</Fret></Property></Note>
+    <Note id="1"><Tie destination="true"/><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>3</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+def test_list_tracks_note_count_excludes_tie_continuations(monkeypatch):
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif",
+                        lambda _p: ET.fromstring(_GPIF_WITH_TIE))
+    tracks = gp2rs_gpx.list_tracks("dummy.gp")
+    # 2 raw notes, 1 of them a tie destination → 1 importable note.
+    assert tracks[0]["notes"] == 1
+
+
+# A hinted "Lead Guitar" followed by an UNHINTED guitar: the unhinted one must
+# advance to the next canonical role ("Rhythm"), not collide into "Lead 2".
+_GPIF_LEAD_THEN_UNHINTED = """
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Lead Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+    <Track id="1"><Name>Guitar 2</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars><MasterBar><Time>4/4</Time><Bars>0 1</Bars></MasterBar></MasterBars>
+  <Bars>
+    <Bar id="0"><Voices>0</Voices></Bar>
+    <Bar id="1"><Voices>1</Voices></Bar>
+  </Bars>
+  <Voices>
+    <Voice id="0"><Beats>0</Beats></Voice>
+    <Voice id="1"><Beats>1</Beats></Voice>
+  </Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="r0"/><Notes>0</Notes></Beat>
+    <Beat id="1"><Rhythm ref="r0"/><Notes>1</Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+    <Note id="1"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+def test_convert_file_unhinted_guitar_takes_next_canonical_role(tmp_path, monkeypatch):
+    # Mix of hinted + unhinted guitars spreads across Lead → Rhythm, not Lead/Lead 2.
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif",
+                        lambda _p: ET.fromstring(_GPIF_LEAD_THEN_UNHINTED))
+    out_files = convert_file("dummy.gp", str(tmp_path), track_indices=[0, 1])
+    names = [ET.parse(f).getroot().findtext("arrangement") for f in out_files]
+    assert names == ["Lead", "Rhythm"]
+
+
+def test_auto_select_gpx_unhinted_guitar_takes_next_canonical_role():
+    # _auto_select_gpx path (auto-select-all): same spread rule.
+    root = ET.fromstring(_GPIF_LEAD_THEN_UNHINTED)
+    tracks = gp2rs_gpx._gpif_tracks(root)
+    _indices, names = gp2rs_gpx._auto_select_gpx(tracks)
+    assert sorted(names.values()) == ["Lead", "Rhythm"]
+
+
+# Codex scenario: unhinted guitar BEFORE a later hinted "Rhythm Guitar". The
+# real rhythm track must still get the canonical "Rhythm" (two-pass reserves
+# hinted roles first); the unhinted one takes the leftover canonical role.
+_GPIF_UNHINTED_BEFORE_RHYTHM = """
+<GPIF>
+  <Score><Title>T</Title><Artist>A</Artist></Score>
+  <Tracks>
+    <Track id="0"><Name>Lead Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+    <Track id="1"><Name>Guitar 2</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+    <Track id="2"><Name>Rhythm Guitar</Name>
+      <Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property></Track>
+  </Tracks>
+  <MasterBars><MasterBar><Time>4/4</Time><Bars>0 1 2</Bars></MasterBar></MasterBars>
+  <Bars>
+    <Bar id="0"><Voices>0</Voices></Bar>
+    <Bar id="1"><Voices>1</Voices></Bar>
+    <Bar id="2"><Voices>2</Voices></Bar>
+  </Bars>
+  <Voices>
+    <Voice id="0"><Beats>0</Beats></Voice>
+    <Voice id="1"><Beats>1</Beats></Voice>
+    <Voice id="2"><Beats>2</Beats></Voice>
+  </Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="r0"/><Notes>0</Notes></Beat>
+    <Beat id="1"><Rhythm ref="r0"/><Notes>1</Notes></Beat>
+    <Beat id="2"><Rhythm ref="r0"/><Notes>2</Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+    <Note id="1"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+    <Note id="2"><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>0</Fret></Property></Note>
+  </Notes>
+  <Rhythms><Rhythm id="r0"><NoteValue>Quarter</NoteValue></Rhythm></Rhythms>
+</GPIF>
+"""
+
+
+def test_convert_file_unhinted_does_not_steal_later_rhythm(tmp_path, monkeypatch):
+    monkeypatch.setattr(gp2rs_gpx, "_load_gpif",
+                        lambda _p: ET.fromstring(_GPIF_UNHINTED_BEFORE_RHYTHM))
+    out_files = convert_file("dummy.gp", str(tmp_path), track_indices=[0, 1, 2])
+    names = [ET.parse(f).getroot().findtext("arrangement") for f in out_files]
+    # Hinted roles reserved first → real Rhythm keeps canonical "Rhythm";
+    # the unhinted middle track takes the leftover canonical role.
+    assert names[0] == "Lead"
+    assert names[2] == "Rhythm"
+    assert names[1] == "Combo"
+    assert "Rhythm 2" not in names and "Lead 2" not in names
+
+
+def test_auto_select_gpx_unhinted_does_not_steal_later_rhythm():
+    root = ET.fromstring(_GPIF_UNHINTED_BEFORE_RHYTHM)
+    tracks = gp2rs_gpx._gpif_tracks(root)
+    indices, names = gp2rs_gpx._auto_select_gpx(tracks)
+    assert names[indices[0]] == "Lead"
+    assert names[indices[2]] == "Rhythm"
+    assert names[indices[1]] == "Combo"

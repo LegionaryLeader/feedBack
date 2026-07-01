@@ -81,7 +81,7 @@ from notation_lift import (  # noqa: E402
     split_hands,
 )
 
-log = logging.getLogger("slopsmith.scripts.lift_keys_notation")
+log = logging.getLogger("feedBack.scripts.lift_keys_notation")
 
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -108,9 +108,10 @@ def _parse_time_signature(raw: object) -> tuple[int, int]:
 
 
 def _load_song_beats(pak: Path, manifest: dict) -> list[dict]:
-    """Song-level beats: ``song_timeline.json`` when present, else the first
+    """Song-level beats: the ``song_timeline`` file when present, else the first
     arrangement JSON that carries a non-empty ``beats`` array (the loader's
-    legacy convention)."""
+    legacy convention). Both the timeline and arrangement files are read via
+    ``load_json``, so either may be ``.json`` or ``.jsonc``."""
     st_rel = manifest.get("song_timeline")
     if isinstance(st_rel, str) and st_rel:
         st_path = _safe_child(pak, st_rel)

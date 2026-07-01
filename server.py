@@ -1,6 +1,7 @@
-"""Slopsmith — FastAPI backend serving highway viewer + library."""
+"""FeedBack — FastAPI backend serving highway viewer + library."""
 
 import asyncio
+import bisect
 import hashlib
 import json
 import logging
@@ -14,9 +15,10 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from logging_setup import configure_logging
+from env_compat import getenv_compat
 configure_logging()
 
-log = logging.getLogger("slopsmith.server")
+log = logging.getLogger("feedBack.server")
 
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -27,13 +29,17 @@ from safepath import safe_join
 from song import (
     anchor_to_wire,
     arrangement_string_count,
+    base_open_string_midis,
     compute_smart_names,
     chord_template_to_wire,
     chord_to_wire,
     hand_shape_to_wire,
+    key_to_tonic_pc,
     load_song,
     note_to_wire,
     phrase_to_wire,
+    pitch_from_base,
+    scale_degree_for_pitch,
 )
 from audio import find_wem_files, convert_wem
 from tunings import tuning_name, DEFAULT_TUNINGS, DEFAULT_REFERENCE_PITCH, apply_reference_pitch
@@ -62,7 +68,7 @@ import xml.etree.ElementTree as ET
 import structlog
 from fastapi import Request
 
-app = FastAPI(title="Slopsmith")
+app = FastAPI(title="FeedBack")
 
 # Plugins that maintain session stores can register a cleanup callback here.
 # The demo-mode janitor calls every registered hook once per hour so stale
@@ -167,6 +173,7 @@ def _run_janitor_hook(hook) -> None:
 _DEMO_BLOCKED: list[tuple[str, re.Pattern]] = [
     ("POST",   re.compile(r"^/api/settings$")),
     ("POST",   re.compile(r"^/api/settings/import$")),
+    ("POST",   re.compile(r"^/api/settings/reset$")),
     ("POST",   re.compile(r"^/api/rescan$")),
     ("POST",   re.compile(r"^/api/rescan/full$")),
     ("POST",   re.compile(r"^/api/songs/upload$")),
@@ -213,6 +220,8 @@ _DEMO_BLOCKED: list[tuple[str, re.Pattern]] = [
     ("POST",   re.compile(r"^/api/playlists/[^/]+/songs$")),
     ("DELETE", re.compile(r"^/api/playlists/[^/]+/songs/.+$")),
     ("POST",   re.compile(r"^/api/playlists/[^/]+/reorder$")),
+    ("POST",   re.compile(r"^/api/playlists/[^/]+/cover$")),
+    ("DELETE", re.compile(r"^/api/playlists/[^/]+/cover$")),
     ("POST",   re.compile(r"^/api/saved/toggle$")),
     # Progression (spec 010) write endpoints — demo mode stays read-only.
     ("POST",   re.compile(r"^/api/progression/paths$")),
@@ -225,17 +234,17 @@ _DEMO_BLOCKED: list[tuple[str, re.Pattern]] = [
 
 @app.middleware("http")
 async def _demo_mode_guard(request: Request, call_next):
-    if os.environ.get("SLOPSMITH_DEMO_MODE") == "1":
+    if getenv_compat("FEEDBACK_DEMO_MODE") or getenv_compat("FEEDBACK_DEMO_MODE") == "1":
         path = request.url.path
         for method, pattern in _DEMO_BLOCKED:
             if request.method == method and pattern.match(path):
                 return JSONResponse({"error": "demo mode: read-only"}, status_code=403)
         response = await call_next(request)
-        if request.method == "GET" and path == "/" and "slopsmith_demo_session" not in request.cookies:
+        if request.method == "GET" and path == "/" and "feedBack_demo_session" not in request.cookies:
             forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
             is_secure = request.url.scheme == "https" or forwarded_proto.lower() == "https"
             response.set_cookie(
-                "slopsmith_demo_session", str(uuid.uuid4()),
+                "feedBack_demo_session", str(uuid.uuid4()),
                 max_age=86400, httponly=True, samesite="lax",
                 secure=is_secure,
             )
@@ -270,11 +279,11 @@ SLOPPAK_CACHE_DIR = CONFIG_DIR / "sloppak_cache"
 
 
 def _env_flag(name: str) -> bool:
-    """Parse a conventional boolean env flag."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Parse a conventional boolean env flag (honours legacy SLOPSMITH_* alias)."""
+    return (getenv_compat(name, "") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Canonical Tuning-filter grouping key (slopsmith#867). tuning_name collapses
+# Canonical Tuning-filter grouping key (feedBack#867). tuning_name collapses
 # every non-standard tuning to "Custom Tuning"; for those rows we key on the
 # raw offsets so distinct customs stay distinct, while named tunings keep
 # grouping by name (stable across the offsets-column migration). Used by both
@@ -355,9 +364,147 @@ def _ensure_smart_names(arrangements: list[dict]) -> list[dict]:
     return arrangements
 
 
+def _sqlite_file_integrity_ok(path: Path) -> bool:
+    """True if `path` is a SQLite database that opens and passes
+    `PRAGMA quick_check`. Used to gate a DB restore so a truncated or
+    corrupt snapshot can never overwrite the live library DB."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(16) != b"SQLite format 3\x00":   # cheap header gate, no full read
+                return False
+    except OSError:
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(str(path))
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        return bool(row) and row[0] == "ok"
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+        # quick_check on a non-WAL file makes no sidecars, but a malformed
+        # file can; sweep them so a probe never litters config_dir.
+        for suffix in ("-wal", "-shm"):
+            try:
+                path.with_name(path.name + suffix).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _apply_pending_db_restore(config_dir: Path) -> None:
+    """Swap in a library DB restored from a settings bundle, if one is
+    staged. A settings import writes the restored snapshot to
+    `web_library.db.restore` rather than over the live DB (the running
+    server holds the old file open, and a stale `-wal`/`-shm` could be
+    replayed onto a fresh main file → corruption). The swap happens here,
+    at startup, BEFORE the connection opens: delete the old DB and its WAL
+    sidecars, then rename the staged snapshot into place. The snapshot is a
+    fully-checkpointed single file (SQLite online-backup API), so it needs
+    no sidecars of its own. Idempotent and a no-op when nothing is staged.
+
+    The staged file is re-validated here before anything is destroyed: a
+    restore that fails its integrity check is discarded and the live DB is
+    left untouched, so a bad bundle can never brick startup or lose data."""
+    pending = config_dir / "web_library.db.restore"
+    if not pending.exists():
+        return
+    if not _sqlite_file_integrity_ok(pending):
+        log.error("pending library DB restore failed its integrity check; "
+                  "discarding it and keeping the existing database")
+        try:
+            pending.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            (config_dir / f"web_library.db{suffix}").unlink()
+        except FileNotFoundError:
+            pass
+    os.replace(pending, config_dir / "web_library.db")
+    log.info("applied pending library DB restore from settings import")
+
+
+# ── Keyset (cursor) pagination for the library grid (feedBack#636 item 3) ─────
+# Forward-only, O(page) deep paging that doesn't grow with OFFSET. Only simple
+# single-column sorts can keyset cleanly (the compound tuning/year sorts fall
+# back to OFFSET). Every sort gets a unique `filename` tiebreak so the order is
+# TOTAL — which also fixes a latent OFFSET skip/dupe across equal-key rows.
+# (column, collate-clause, primary-direction) — tiebreak is always `filename` ASC.
+_KEYSET_SORTS = {
+    "artist": ("artist", "COLLATE NOCASE", "ASC"),
+    "artist-desc": ("artist", "COLLATE NOCASE", "DESC"),
+    "title": ("title", "COLLATE NOCASE", "ASC"),
+    "title-desc": ("title", "COLLATE NOCASE", "DESC"),
+    "recent": ("mtime", "", "DESC"),
+}
+# Index into a query_page row tuple for each keyset column (see the SELECT in
+# query_page: filename, title, artist, ... mtime at 9).
+_KEYSET_ROW_IDX = {"artist": 2, "title": 1, "mtime": 9}
+
+
+def _encode_cursor(values: list) -> str:
+    import base64
+    return base64.urlsafe_b64encode(json.dumps(values).encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str):
+    """Decode an opaque keyset cursor to [sort_value, filename], or None if it's
+    malformed (a bad cursor degrades to the first page, never 500s)."""
+    import base64
+    try:
+        out = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+    except (ValueError, TypeError):
+        return None
+    return out if isinstance(out, list) and len(out) == 2 else None
+
+
+def _effective_keyset_sort(sort: str, direction: str) -> str:
+    """Fold the legacy `dir=desc` toggle into the canonical keyset sort key, so
+    the seek/cursor direction matches the ORDER BY that same toggle produces
+    (without this, `sort=artist&dir=desc` would seek with `>` against a DESC
+    order → gaps/dupes)."""
+    if direction == "desc" and sort in ("artist", "title"):
+        return sort + "-desc"
+    return sort
+
+
+def _keyset_seek(col: str, collate: str, primary_dir: str, cv, fn: str):
+    """(sql, params) for 'rows strictly after (cv, fn)' in the total order
+    `<col> <primary_dir>, filename ASC`, matching SQLite's NULL placement
+    (NULLs sort first in ASC, last in DESC) so keyset is exactly OFFSET-
+    equivalent even for NULL sort keys."""
+    ce = f"{col} {collate}".strip()
+    if primary_dir == "ASC":   # NULLs first
+        if cv is None:
+            return (f"(({col} IS NULL AND filename > ?) OR {col} IS NOT NULL)", [fn])
+        return (f"({col} IS NOT NULL AND ({ce} > ? OR ({ce} = ? AND filename > ?)))",
+                [cv, cv, fn])
+    # DESC — NULLs last
+    if cv is None:
+        return (f"({col} IS NULL AND filename > ?)", [fn])
+    return (f"({col} IS NULL OR ({col} IS NOT NULL AND "
+            f"({ce} < ? OR ({ce} = ? AND filename > ?))))", [cv, cv, fn])
+
+
+def next_library_cursor(sort: str, last_song: dict | None) -> str | None:
+    """The cursor for the last row of a page, so the next request resumes after
+    it. None when the sort can't keyset or the page was empty."""
+    if sort not in _KEYSET_SORTS or not last_song:
+        return None
+    col = _KEYSET_SORTS[sort][0]
+    key = "mtime" if col == "mtime" else col
+    if key not in last_song or "filename" not in last_song:
+        return None
+    return _encode_cursor([last_song[key], last_song["filename"]])
+
+
 class MetadataDB:
     def __init__(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _apply_pending_db_restore(CONFIG_DIR)
         self.db_path = str(CONFIG_DIR / "web_library.db")
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -386,14 +533,14 @@ class MetadataDB:
         for ddl in (
             "ALTER TABLE songs ADD COLUMN format TEXT DEFAULT 'archive'",
             "ALTER TABLE songs ADD COLUMN stem_count INTEGER DEFAULT 0",
-            # slopsmith#129: per-stem filter needs the id list, not just count.
+            # feedBack#129: per-stem filter needs the id list, not just count.
             "ALTER TABLE songs ADD COLUMN stem_ids TEXT DEFAULT '[]'",
-            # slopsmith#69 + #22: denormalized canonical tuning name + numeric
+            # feedBack#69 + #22: denormalized canonical tuning name + numeric
             # sort key (sum of offsets). The existing `tuning` text column
             # stays — these are caches, repopulated on rescan.
             "ALTER TABLE songs ADD COLUMN tuning_name TEXT DEFAULT ''",
             "ALTER TABLE songs ADD COLUMN tuning_sort_key INTEGER DEFAULT 0",
-            # slopsmith#867: raw per-string offsets (space-joined ints) so the
+            # feedBack#867: raw per-string offsets (space-joined ints) so the
             # v3 client can render target notes and the Tuning filter can keep
             # distinct custom tunings distinct (tuning_name collapses them all
             # to "Custom Tuning"). Cache; repopulated on rescan.
@@ -405,6 +552,13 @@ class MetadataDB:
                 pass
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_artist ON songs(artist COLLATE NOCASE)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_title ON songs(title COLLATE NOCASE)")
+        # Composite (sort col, filename) indexes cover the grid's ORDER BY +
+        # its unique filename tiebreak — for both the OFFSET scan and keyset
+        # seek (feedBack#636 item 3). idx_songs_artist/title above stay for the
+        # distinct-artist / letter-bar aggregates.
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_artist_fn ON songs(artist COLLATE NOCASE, filename)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_title_fn ON songs(title COLLATE NOCASE, filename)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_mtime_fn ON songs(mtime, filename)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_tuning_name ON songs(tuning_name COLLATE NOCASE)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_tuning_sort_key ON songs(tuning_sort_key)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_year ON songs(year)")
@@ -503,6 +657,39 @@ class MetadataDB:
             )
         """)
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_system_key ON playlists(system_key) WHERE system_key IS NOT NULL")
+        # Smart collections (feedBack#636 item 2): a playlist row whose `rules`
+        # JSON is non-NULL is a smart/dynamic collection — its membership is the
+        # LIVE result of those library filter params, not a stored song list.
+        # It surfaces as a registered library provider (the v3 source picker),
+        # so it inherits the whole Songs UI. Additive, idempotent migration.
+        try:
+            self.conn.execute("ALTER TABLE playlists ADD COLUMN rules TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # Wishlist / "wanted" (feedBack#636 item 4): a persisted, actionable
+        # list of songs the user does NOT own yet — the *arr "Wanted/Monitored"
+        # analogue. Unlike playlists (which reference owned local songs by
+        # filename), a wanted entry has no local file, so it lives in its own
+        # table keyed by descriptive identity. Producers (the find_more plugin's
+        # ownership-diff, or a manual add) POST here; the consuming UI reads it.
+        # Additive + idempotent.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS wanted (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artist TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',      -- e.g. 'find_more', 'manual'
+                source_ref TEXT NOT NULL DEFAULT '',  -- opaque id/url within that source
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT
+            )
+        """)
+        # Identity = (artist, title, source, source_ref), case-insensitive on
+        # the human fields, so re-running an ownership-diff doesn't duplicate.
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wanted_identity "
+            "ON wanted(artist COLLATE NOCASE, title COLLATE NOCASE, source, source_ref)"
+        )
         # Progression (spec 010): instrument paths, challenges, quests, the
         # Decibels wallet, and the cosmetics shop. Targets/titles live in the
         # bundled content (data/progression/); these tables hold only player
@@ -575,6 +762,88 @@ class MetadataDB:
         self.conn.execute("INSERT OR IGNORE INTO wallet (id) VALUES (1)")
         self.conn.commit()
         self._lock = threading.Lock()
+        # One-time repair of pre-fix rows written under URL-encoded filenames
+        # (idempotent: a no-op once every row is canonical).
+        self._migrate_decode_stat_filenames()
+
+    def _song_exists(self, filename: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM songs WHERE filename = ?", (filename,)).fetchone() is not None
+
+    def _canonical_song_filename(self, filename: str) -> str:
+        """Map a (possibly URL-encoded) filename to the `songs` library key.
+
+        The recorder relays encodeURIComponent'd names ('/'→'%2F', ' '→'%20'),
+        but `songs` keys on the decoded on-disk path. Decoding is LIBRARY-AWARE so
+        a real filename that legitimately contains literal %XX is never corrupted:
+        prefer the form that already exists in `songs`, and decode only when the
+        decoded form resolves to a real song. When NEITHER form is in the library
+        (e.g. a play recorded before the library scan finishes) keep the stored
+        name unchanged — the next-startup migration canonicalizes it once the song
+        is scanned, rather than risk corrupting a real %XX name now."""
+        if not isinstance(filename, str):
+            return filename
+        if self._song_exists(filename):
+            return filename                      # already a real library key (may contain %)
+        from urllib.parse import unquote
+        decoded = unquote(filename)
+        if decoded != filename and self._song_exists(decoded):
+            return decoded                       # encoded → real library key
+        return filename                          # neither in library: leave as-is (heals on migrate)
+
+    def _migrate_decode_stat_filenames(self):
+        """Rewrite URL-encoded song_stats.filename rows to the decoded
+        library-path key (the form `songs` uses). Pre-fix, the recorder stored
+        encodeURIComponent'd names, so every recorded best was invisible to the
+        reads that filter on `filename IN (SELECT filename FROM songs)`. Merge on
+        collision — two encoded rows decoding to the same name, or an encoded row
+        meeting an already-decoded one — with the same best=max / plays=sum /
+        last-wins semantics as song_score.merge_stats, so the (filename,
+        arrangement) primary key is never violated.
+
+        Library-aware via the shared _canonical_song_filename rule: only decode a
+        row when the decoded form is a real song, so a correctly-stored name
+        containing literal %XX is never rewritten, and dead-song/orphan rows
+        (neither form in the library) are left exactly as-is."""
+        cols = self._STATS_COLS
+        with self._lock:
+            rows = [dict(zip(cols, r)) for r in self.conn.execute(
+                "SELECT " + ", ".join(cols) + " FROM song_stats").fetchall()]
+            canon = self._canonical_song_filename
+            if all(canon(r["filename"]) == r["filename"] for r in rows):
+                return  # every row already canonical (or an untouchable orphan)
+            merged: dict = {}
+            for r in rows:
+                key = (canon(r["filename"]), int(r["arrangement"]))
+                cur = merged.get(key)
+                if cur is None:
+                    merged[key] = dict(r, filename=key[0], arrangement=key[1])
+                    continue
+                # Most-recently-updated row wins the "last_*"/position fields.
+                def _stamp(x):
+                    return str(x.get("updated_at") or x.get("last_played_at") or "")
+                newer = r if _stamp(r) >= _stamp(cur) else cur
+                merged[key] = {
+                    "filename": key[0], "arrangement": key[1],
+                    "plays": (cur["plays"] or 0) + (r["plays"] or 0),
+                    "best_score": max(cur["best_score"] or 0, r["best_score"] or 0),
+                    "best_accuracy": max(cur["best_accuracy"] or 0.0, r["best_accuracy"] or 0.0),
+                    "last_score": newer["last_score"], "last_accuracy": newer["last_accuracy"],
+                    "last_position": newer["last_position"],
+                    "last_played_at": newer["last_played_at"], "updated_at": newer["updated_at"],
+                }
+            # Atomic swap: clear and reinsert the canonicalized set in one txn.
+            try:
+                self.conn.execute("DELETE FROM song_stats")
+                self.conn.executemany(
+                    "INSERT INTO song_stats (" + ", ".join(cols) + ") VALUES ("
+                    + ", ".join("?" * len(cols)) + ")",
+                    [tuple(m[c] for c in cols) for m in merged.values()],
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def is_favorite(self, filename: str) -> bool:
         return self.conn.execute("SELECT 1 FROM favorites WHERE filename = ?", (filename,)).fetchone() is not None
@@ -1175,6 +1444,25 @@ class MetadataDB:
         ).fetchall()
         return {r[0]: r[1] for r in rows if r[2] and r[2] > 0}
 
+    def top_stats(self, limit: int = 5) -> list[dict]:
+        """Top scored songs (best score first) for the profile 'Your best
+        scores' panel. Aggregated per-song across arrangements (best score,
+        best accuracy, total plays), only SCORED songs (plays > 0), dead songs
+        skipped. Mirrors best_accuracy_map's grouping; enriched with metadata
+        by the /api/stats/top route."""
+        limit = max(1, min(50, int(limit)))
+        rows = self.conn.execute(
+            "SELECT filename, MAX(best_score), MAX(best_accuracy), SUM(plays) "
+            "FROM song_stats WHERE 1=1 " + self._existing_song_filter() +   # skip dead songs
+            "GROUP BY filename HAVING SUM(plays) > 0 "
+            "ORDER BY MAX(best_score) DESC, MAX(best_accuracy) DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {"filename": r[0], "best_score": r[1], "best_accuracy": r[2], "plays": r[3]}
+            for r in rows
+        ]
+
     # ── Playlists ─────────────────────────────────────────────────────────--
     SAVED_KEY = "saved_for_later"
 
@@ -1215,14 +1503,31 @@ class MetadataDB:
         return None
 
     def list_playlists(self) -> list[dict]:
+        from urllib.parse import quote
         rows = self.conn.execute(
             "SELECT id, name, system_key, created_at, updated_at FROM playlists "
+            "WHERE rules IS NULL "          # smart collections live in the source picker, not here
             "ORDER BY (system_key IS NULL), name COLLATE NOCASE"
         ).fetchall()
-        return [{
-            "id": r[0], "name": r[1], "system_key": r[2],
-            "created_at": r[3], "updated_at": r[4], "count": self._playlist_count(r[0]),
-        } for r in rows]
+        out = []
+        for r in rows:
+            pid = r[0]
+            # First few still-present songs (in order) → art URLs, for a
+            # content-dependent playlist cover (single art / 2x2 mosaic). The
+            # JOIN drops dead songs, matching get_playlist's visibility.
+            arts = self.conn.execute(
+                "SELECT ps.filename FROM playlist_songs ps "
+                "JOIN songs s ON s.filename = ps.filename "
+                "WHERE ps.playlist_id = ? ORDER BY ps.position LIMIT 4",
+                (pid,),
+            ).fetchall()
+            out.append({
+                "id": pid, "name": r[1], "system_key": r[2],
+                "created_at": r[3], "updated_at": r[4],
+                "count": self._playlist_count(pid),
+                "art_urls": [f"/api/song/{quote(a[0])}/art" for a in arts],
+            })
+        return out
 
     def create_playlist(self, name: str, system_key: str | None = None) -> dict:
         with self._lock:
@@ -1273,14 +1578,79 @@ class MetadataDB:
             self.conn.commit()
             return cur.rowcount > 0
 
+    # ── Smart collections (feedBack#636 item 2) ───────────────────────────
+    @staticmethod
+    def _collection_row(r) -> dict:
+        rules = {}
+        if r[3]:
+            try:
+                parsed = json.loads(r[3])
+                if isinstance(parsed, dict):
+                    rules = parsed
+            except (ValueError, TypeError):
+                rules = {}
+        return {"id": r[0], "name": r[1], "system_key": r[2], "rules": rules,
+                "created_at": r[4], "updated_at": r[5]}
+
+    def is_collection(self, pid: int) -> bool:
+        row = self.conn.execute(
+            "SELECT rules IS NOT NULL FROM playlists WHERE id = ?", (pid,)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def list_collections(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, name, system_key, rules, created_at, updated_at FROM playlists "
+            "WHERE rules IS NOT NULL ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return [self._collection_row(r) for r in rows]
+
+    def get_collection(self, pid: int) -> dict | None:
+        r = self.conn.execute(
+            "SELECT id, name, system_key, rules, created_at, updated_at FROM playlists "
+            "WHERE id = ? AND rules IS NOT NULL", (pid,)
+        ).fetchone()
+        return self._collection_row(r) if r else None
+
+    def create_collection(self, name: str, rules: dict) -> dict:
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO playlists (name, system_key, rules, created_at, updated_at) "
+                "VALUES (?, NULL, ?, datetime('now'), datetime('now'))",
+                (name, json.dumps(rules or {})),
+            )
+            self.conn.commit()
+            pid = cur.lastrowid
+        return self.get_collection(pid)
+
+    def update_collection(self, pid: int, name: str | None = None,
+                          rules: dict | None = None) -> dict | None:
+        if not self.is_collection(pid):
+            return None
+        with self._lock:
+            if name is not None:
+                self.conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (name, pid))
+            if rules is not None:
+                self.conn.execute("UPDATE playlists SET rules = ? WHERE id = ?",
+                                  (json.dumps(rules or {}), pid))
+            self.conn.execute("UPDATE playlists SET updated_at = datetime('now') WHERE id = ?", (pid,))
+            self.conn.commit()
+        return self.get_collection(pid)
+
     def get_playlist(self, pid: int) -> dict | None:
         # A path-param int outside SQLite's 64-bit range raises OverflowError at
         # bind time (→ 500). Treat it as a miss; every mutating playlist handler
         # gates on this first, so the guard covers them too.
         if not isinstance(pid, int) or not (-(2**63) <= pid < 2**63):
             return None
+        # `rules IS NULL` excludes smart collections (#636 item 2): they share
+        # the playlists table but their membership is rules-based, so every
+        # manual-playlist mutation (add/remove/reorder/cover) that gates on
+        # get_playlist uniformly 404s on a collection id — collections are
+        # managed only through /api/collections.
         head = self.conn.execute(
-            "SELECT id, name, system_key, created_at, updated_at FROM playlists WHERE id = ?", (pid,)
+            "SELECT id, name, system_key, created_at, updated_at FROM playlists "
+            "WHERE id = ? AND rules IS NULL", (pid,)
         ).fetchone()
         if not head:
             return None
@@ -1368,6 +1738,52 @@ class MetadataDB:
             self.conn.execute("UPDATE playlists SET updated_at = datetime('now') WHERE id = ?", (pid,))
             self.conn.commit()
         return new_state
+
+    # ── Wishlist / "wanted" (feedBack#636 item 4) ─────────────────────────
+    _WANTED_COLS = ("id", "artist", "title", "source", "source_ref", "note", "created_at")
+
+    def add_wanted(self, artist: str, title: str, source: str = "manual",
+                   source_ref: str = "", note: str = "") -> dict:
+        """Add a not-owned song to the wishlist (or return the existing row if
+        an entry with the same identity is already wanted — idempotent, so a
+        re-run of an ownership-diff doesn't duplicate). Returns the row."""
+        artist = (artist or "").strip()
+        title = (title or "").strip()
+        source = (source or "manual").strip() or "manual"
+        source_ref = (source_ref or "").strip()
+        note = (note or "").strip()
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO wanted (artist, title, source, source_ref, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                (artist, title, source, source_ref, note),
+            )
+            row = self.conn.execute(
+                "SELECT " + ", ".join(self._WANTED_COLS) + " FROM wanted "
+                "WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE "
+                "AND source = ? AND source_ref = ?",
+                (artist, title, source, source_ref),
+            ).fetchone()
+            self.conn.commit()
+        return dict(zip(self._WANTED_COLS, row)) if row else {}
+
+    def list_wanted(self) -> list[dict]:
+        """All wishlist entries, newest first."""
+        rows = self.conn.execute(
+            "SELECT " + ", ".join(self._WANTED_COLS) + " FROM wanted "
+            "ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        return [dict(zip(self._WANTED_COLS, r)) for r in rows]
+
+    def remove_wanted(self, wanted_id: int) -> bool:
+        """Drop a wishlist entry by id. Returns True if a row was removed."""
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM wanted WHERE id = ?", (wanted_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def count_wanted(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM wanted").fetchone()[0]
 
     def continue_session(self) -> dict | None:
         """Most-recently-played song (from song_stats) + metadata, for the
@@ -1476,7 +1892,7 @@ class MetadataDB:
     # Manifest-allowed filter values. Whitelisted before binding so a
     # malformed query string can't push arbitrary text through to SQL —
     # parameters are bound, but capping the input space is still cheap
-    # defense-in-depth (see slopsmith#129).
+    # defense-in-depth (see feedBack#129).
     _ALLOWED_ARRANGEMENT_NAMES = {"Lead", "Rhythm", "Bass", "Combo"}
     # Per-smart-type list of (sql_op, sql_param) pairs appended to the SQL
     # name-fallback branch (key-absent smart_name). Covers legacy raw names
@@ -1516,7 +1932,7 @@ class MetadataDB:
                      naming_mode: str = "legacy") -> tuple[str, list]:
         """Shared WHERE-clause builder for query_page / query_artists /
         query_stats. Returns (where_sql, params). Leading 'WHERE' is
-        included so callers paste it directly. See slopsmith#129/#69.
+        included so callers paste it directly. See feedBack#129/#69.
         """
         where = "WHERE title != ''"
         params: list = []
@@ -1683,8 +2099,14 @@ class MetadataDB:
                    stems_lacks: list[str] | None = None,
                    has_lyrics: int | None = None,
                    tunings: list[str] | None = None,
+                   after: str | None = None,
                    naming_mode: str = "legacy") -> tuple[list[dict], int]:
-        """Server-side paginated search. Returns (songs, total_count)."""
+        """Server-side paginated search. Returns (songs, total_count).
+
+        `after` is an opaque keyset cursor (the last row of the previous page).
+        When supplied and the sort can keyset, the page is fetched with a
+        WHERE-seek instead of OFFSET — O(page), independent of depth. Unknown
+        sorts / bad cursors fall back to OFFSET, so it's always safe."""
         where, params = self._build_where(
             q=q, favorites_only=favorites_only, format_filter=format_filter,
             artist_filter=artist_filter, album_filter=album_filter,
@@ -1698,7 +2120,7 @@ class MetadataDB:
             "title": "title COLLATE NOCASE", "title-desc": "title COLLATE NOCASE DESC",
             "recent": "mtime DESC",
             # Tuning sort uses musical distance from E Standard
-            # (slopsmith#22 — was alphabetical). `tuning_sort_key` is
+            # (feedBack#22 — was alphabetical). `tuning_sort_key` is
             # the sum of per-string offsets, so |sort_key| is the
             # magnitude of the down/up-tune. ABS ascending puts E
             # Standard (0) first, then ±2 (Drop D, F Standard), then
@@ -1726,7 +2148,7 @@ class MetadataDB:
                 "COALESCE(tuning_sort_key, 0) ASC, "
                 "COALESCE(tuning_name, '') COLLATE NOCASE"
             ),
-            # Year sort (slopsmith#128). Empty-year rows pushed to the
+            # Year sort (feedBack#128). Empty-year rows pushed to the
             # bottom for both directions; otherwise CAST so '2010' >
             # '2005' rather than alphabetic.
             "year": "(year = '') ASC, CAST(year AS INTEGER) ASC",
@@ -1742,14 +2164,33 @@ class MetadataDB:
         # those sorts use the explicit `-desc` sort key instead.
         if direction == "desc" and " ASC" not in order and " DESC" not in order:
             order += " DESC"
+        # Unique, deterministic tiebreak → a TOTAL order. Without it, rows with
+        # an equal sort key can reshuffle between OFFSET pages (skip/dupe); it's
+        # also what makes keyset seeking correct.
+        order += ", filename"
 
         total = self.conn.execute(f"SELECT COUNT(*) FROM songs {where}", params).fetchone()[0]
-        rows = self.conn.execute(
-            f"SELECT filename, title, artist, album, year, duration, tuning, arrangements, has_lyrics, mtime, "
-            f"format, stem_count, stem_ids, tuning_name, tuning_offsets "
-            f"FROM songs {where} ORDER BY {order} LIMIT ? OFFSET ?",
-            params + [size, page * size]
-        ).fetchall()
+
+        cols = ("SELECT filename, title, artist, album, year, duration, tuning, "
+                "arrangements, has_lyrics, mtime, format, stem_count, stem_ids, "
+                "tuning_name, tuning_offsets FROM songs ")
+        cursor = _decode_cursor(after) if after else None
+        eff_sort = _effective_keyset_sort(sort, direction)
+        if cursor and eff_sort in _KEYSET_SORTS:
+            # Keyset seek: rows strictly after the cursor in the total order
+            # `<col> <dir>, filename ASC` (NULL-aware, so == OFFSET exactly).
+            col, collate, primary_dir = _KEYSET_SORTS[eff_sort]
+            seek, seek_params = _keyset_seek(col, collate, primary_dir, cursor[0], cursor[1])
+            seek_where = where + (" AND " if where else " WHERE ") + seek
+            rows = self.conn.execute(
+                f"{cols}{seek_where} ORDER BY {order} LIMIT ?",
+                params + seek_params + [size],
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"{cols}{where} ORDER BY {order} LIMIT ? OFFSET ?",
+                params + [size, page * size],
+            ).fetchall()
 
         estd = self._estd_set()
         favs = self.favorite_set()
@@ -1869,10 +2310,24 @@ class MetadataDB:
                     stems_lacks: list[str] | None = None,
                     has_lyrics: int | None = None,
                     tunings: list[str] | None = None,
+                    sort: str = "artist",
+                    want_sort_letters: bool = False,
                     naming_mode: str = "legacy") -> dict:
         """Aggregate stats for the letter bar. Accepts the same filter
         params as query_page so the letter counts stay synchronized
-        with the grid when filters are active."""
+        with the grid when filters are active.
+
+        `sort` selects the column the v3 jump rail's `sort_letters`
+        breakdown keys on (artist for artist sorts, title for title
+        sorts) so the rail's present-letters match the grid's actual
+        order; other sorts fall back to artist (the rail is hidden for
+        them client-side anyway). The legacy `letters` field is always
+        the artist breakdown, unchanged, for the dashboard + classic tree.
+
+        `sort_letters` is computed (and the key included) ONLY when
+        `want_sort_letters` is set — the jump rail opts in, while the
+        dashboard / v2 tree read only `letters` and skip the extra
+        per-letter aggregate scan."""
         where, params = self._build_where(
             q=q, favorites_only=favorites_only, format_filter=format_filter,
             artist_filter=artist_filter, album_filter=album_filter,
@@ -1903,7 +2358,30 @@ class MetadataDB:
                 letters[key] = letters.get(key, 0) + count
             else:
                 letters["#"] = letters.get("#", 0) + count
-        return {"total_songs": total, "total_artists": artist_count, "letters": letters}
+        result = {"total_songs": total, "total_artists": artist_count, "letters": letters}
+        # Active-sort letter buckets for the v3 jump rail. Counts SONGS (the
+        # grid's unit, unlike `letters` which counts distinct artists) per
+        # first-letter bucket of the column the active sort keys on, so a tap
+        # on a present letter always finds a card. Non-A–Z first chars bucket
+        # under '#'. Only artist/title sorts are alphabetical; anything else
+        # keys on artist here but the client hides the rail for it. Computed
+        # only when the caller opts in, so non-rail callers skip the scan.
+        if want_sort_letters:
+            sort_col = "title" if sort in ("title", "title-desc") else "artist"
+            sort_rows = self.conn.execute(
+                f"SELECT UPPER(SUBSTR(COALESCE({sort_col}, ''), 1, 1)) AS letter, COUNT(*) "
+                f"FROM songs {where} GROUP BY letter", params
+            ).fetchall()
+            sort_letters: dict[str, int] = {}
+            for letter, count in sort_rows:
+                count = int(count or 0)
+                if count <= 0:
+                    continue
+                key = str(letter or "")
+                bucket = key if (key.isascii() and key.isalpha()) else "#"
+                sort_letters[bucket] = sort_letters.get(bucket, 0) + count
+            result["sort_letters"] = sort_letters
+        return result
 
 
 class AudioEffectsMappingDB:
@@ -2397,7 +2875,126 @@ class LibraryProviderRegistry:
 
 
 library_providers = LibraryProviderRegistry()
-library_providers.register(LocalLibraryProvider(meta_db))
+_local_library_provider = LocalLibraryProvider(meta_db)
+library_providers.register(_local_library_provider)
+
+
+# Keys `_library_filter_args` (and a smart collection's stored `rules`) accept.
+_LIBRARY_FILTER_PARAM_KEYS = frozenset((
+    "q", "favorites", "format", "artist", "album",
+    "arrangements_has", "arrangements_lacks", "stems_has", "stems_lacks",
+    "has_lyrics", "tunings",
+))
+# Rules mirror the raw /api/library query params (so the provider can feed them
+# straight through `_library_filter_args`, and the frontend can build a rule from
+# the same query string it already constructs). Multi-value filters are CSV
+# strings; `favorites` is 0/1; the rest are plain strings.
+_RULE_CSV_KEYS = frozenset((
+    "tunings", "arrangements_has", "arrangements_lacks", "stems_has", "stems_lacks",
+))
+_RULE_STR_KEYS = frozenset(("q", "format", "artist", "album", "has_lyrics", "sort"))
+
+
+def _sanitize_collection_rules(raw) -> dict:
+    """Normalize rules to the raw query-param format, keeping only known keys. A
+    list for a multi-value filter is joined to CSV; `favorites` becomes 0/1.
+    Unknown keys are dropped so a rule survives a filter-vocab change rather than
+    500-ing. Applied at API ingress AND when a provider loads a persisted row, so
+    a hand-edited / imported bad value (e.g. an int where a string is expected,
+    or a list for `sort`) can never crash a query."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for k, v in raw.items():
+        if k in _RULE_CSV_KEYS:
+            if isinstance(v, list):
+                vals = [str(x) for x in v if isinstance(x, (str, int)) and not isinstance(x, bool)]
+            elif isinstance(v, str):
+                vals = [s for s in (p.strip() for p in v.split(",")) if s]
+            else:
+                continue
+            if vals:
+                out[k] = ",".join(vals)
+        elif k == "favorites":
+            if v:
+                out[k] = 1
+        elif k in _RULE_STR_KEYS:
+            if isinstance(v, (str, int)) and not isinstance(v, bool):
+                s = str(v).strip()
+                if s:
+                    out[k] = s
+    return out
+
+
+class SmartCollectionProvider:
+    """A saved library filter, surfaced as a source (#636 item 2). Browse/stats
+    delegate to the local DB with the collection's stored `rules` applied — so
+    selecting it in the v3 source picker shows exactly that filtered slice with
+    the whole Songs UI (paging, stats, A–Z rail, art) for free. P1: the rules
+    ARE the query (live in-collection search is a P2 nicety). The matched songs
+    are local rows, so `kind="local"` keeps the client's play/art paths on the
+    local (not remote-sync) branch and art delegates straight through."""
+    kind = "local"
+    capabilities = ("library.read", "art.read")
+
+    def __init__(self, collection: dict, local: "LocalLibraryProvider"):
+        self._local = local
+        self.update(collection)
+
+    def update(self, collection: dict) -> None:
+        self.id = f"collection:{collection['id']}"
+        self.collection_id = collection["id"]
+        self.label = collection.get("name") or "Collection"
+        # Re-sanitize on load: persisted JSON may predate the current vocab or
+        # have been hand-edited; never let a bad value reach a query.
+        self._rules = _sanitize_collection_rules(collection.get("rules") or {})
+
+    def _filter_kwargs(self) -> dict:
+        return _library_filter_args(**{k: v for k, v in self._rules.items()
+                                       if k in _LIBRARY_FILTER_PARAM_KEYS})
+
+    def _sort(self, fallback: str) -> str:
+        # A collection may pin its own sort (e.g. "recently added"); query_page
+        # falls back safely for an unknown value, so no validation needed here.
+        return self._rules.get("sort") or fallback
+
+    def query_page(self, *, page=0, size=24, sort="artist", direction="asc",
+                   naming_mode="legacy", **_ignore):
+        return self._local._db.query_page(
+            page=page, size=size, sort=self._sort(sort), direction=direction,
+            naming_mode=naming_mode, **self._filter_kwargs())
+
+    def query_artists(self, *, letter="", page=0, size=50, naming_mode="legacy", **_ignore):
+        return self._local._db.query_artists(
+            letter=letter, page=page, size=size, naming_mode=naming_mode,
+            **self._filter_kwargs())
+
+    def query_stats(self, *, sort="artist", want_sort_letters=False,
+                    naming_mode="legacy", **_ignore):
+        return self._local._db.query_stats(
+            sort=self._sort(sort), want_sort_letters=want_sort_letters,
+            naming_mode=naming_mode, **self._filter_kwargs())
+
+    def tuning_names(self):
+        return self._local.tuning_names()
+
+    async def get_art(self, song_id: str):
+        return await self._local.get_art(song_id)
+
+
+def _sync_collection_provider(collection: dict) -> None:
+    """Register (or replace) the provider for one collection."""
+    library_providers.register(
+        SmartCollectionProvider(collection, _local_library_provider), replace=True)
+
+
+def _unregister_collection_provider(pid: int) -> None:
+    library_providers.unregister(f"collection:{pid}")
+
+
+# Boot scan: surface every saved collection as a source.
+for _c in meta_db.list_collections():
+    _sync_collection_provider(_c)
 
 
 def register_library_provider(provider: object, *, replace: bool = False, owner_plugin_id: str | None = None) -> object:
@@ -2476,7 +3073,7 @@ def _require_library_provider_capability(provider: object, capability: str) -> N
     )
 
 
-_OPTIONAL_NEW_PROVIDER_KWARGS = ("naming_mode",)
+_OPTIONAL_NEW_PROVIDER_KWARGS = ("naming_mode", "sort", "want_sort_letters", "after")
 
 
 def _filter_provider_kwargs(method: object, kwargs: dict) -> dict:
@@ -2772,6 +3369,35 @@ def _sanitized_song_offset(song) -> float:
     return v if math.isfinite(v) else 0.0
 
 
+def _sanitize_authors(manifest: dict | None) -> list[dict]:
+    """Extract a display-safe contributor list from a feedpak manifest.
+
+    The feedpak spec (§5.4) defines an OPTIONAL top-level `authors` list of
+    objects `{name (required), role?, email?, url?}`. We surface only `name`
+    and `role` to the highway — contact fields (email/url) are intentionally
+    dropped from the on-screen credits. Malformed entries (non-dict, missing /
+    blank name) are skipped; absent / non-list `authors` yields `[]`.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    raw = manifest.get("authors")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        role = entry.get("role")
+        out.append({
+            "name": name.strip(),
+            "role": role.strip() if isinstance(role, str) and role.strip() else None,
+        })
+    return out
+
+
 def _stat_for_cache(f: Path) -> tuple[float, int]:
     """Return (mtime, size) for cache freshness checks.
 
@@ -2844,7 +3470,7 @@ _scan_status = dict(_SCAN_STATUS_INIT)
 _STARTUP_STATUS_INIT = {
     "running": True,
     "phase": "booting",
-    "message": "Starting Slopsmith server...",
+    "message": "Starting FeedBack server...",
     "current_plugin": "",
     "loaded": 0,
     "total": 0,
@@ -2928,13 +3554,13 @@ def _make_scan_executor():
     mp_ctx = multiprocessing.get_context("spawn")
     # Default to one worker per core so CPU-bound metadata parsing uses the
     # whole machine (the point of moving to processes).
-    # SLOPSMITH_MAX_SCAN_WORKERS (set by the Desktop launcher to cap memory
+    # FEEDBACK_MAX_SCAN_WORKERS (set by the Desktop launcher to cap memory
     # usage on low-RAM machines — e.g. 8 GB M2 MacBook Air) takes priority;
     # SCAN_MAX_WORKERS is a legacy override for Docker/bare installs.
     # A malformed override falls back to the core count rather than crashing.
     try:
         max_workers = int(
-            os.environ.get("SLOPSMITH_MAX_SCAN_WORKERS")
+            getenv_compat("FEEDBACK_MAX_SCAN_WORKERS")
             or os.environ.get("SCAN_MAX_WORKERS")
             or (os.cpu_count() or 1)
         )
@@ -2954,14 +3580,14 @@ def _make_scan_executor():
 _BUILTIN_DIAGNOSTIC_SUBDIR = "diagnostics-builtin"
 _BUILTIN_DIAGNOSTIC_SOURCES: list[tuple[str, str]] = [
     (
-        "slopsmith-diagnostic-basic-guitar.sloppak",
-        "docs/diagnostics/slopsmith-diagnostic-basic-guitar.sloppak",
+        "feedBack-diagnostic-basic-guitar.sloppak",
+        "docs/diagnostics/feedBack-diagnostic-basic-guitar.sloppak",
     ),
 ]
 
 
-def _slopsmith_server_root() -> Path:
-    """Directory containing server.py (repo root in dev; resources/slopsmith when bundled)."""
+def _feedBack_server_root() -> Path:
+    """Directory containing server.py (repo root in dev; resources/feedBack when bundled)."""
     return Path(__file__).resolve().parent
 
 
@@ -2973,7 +3599,7 @@ def _builtin_diagnostic_filename() -> str:
 
 # Progression content (spec 010): bundled JSON under data/progression/ (paths,
 # quest pools, shop catalog). Loaded lazily-once; invalid entries are logged
-# warnings, never fatal. SLOPSMITH_PROGRESSION_DATA overrides the root (tests).
+# warnings, never fatal. FEEDBACK_PROGRESSION_DATA overrides the root (tests).
 _progression_content: dict | None = None
 _progression_content_lock = threading.Lock()
 
@@ -2984,8 +3610,8 @@ def _get_progression_content() -> dict:
         with _progression_content_lock:
             if _progression_content is None:
                 import progression as progression_mod
-                root = os.environ.get("SLOPSMITH_PROGRESSION_DATA") or (
-                    _slopsmith_server_root() / "data" / "progression"
+                root = getenv_compat("FEEDBACK_PROGRESSION_DATA") or (
+                    _feedBack_server_root() / "data" / "progression"
                 )
                 content, warnings = progression_mod.load_content(root)
                 for warning in warnings:
@@ -3009,7 +3635,7 @@ def _seed_builtin_diagnostic_sloppaks(dlc: Path | None = None) -> None:
             log.debug("Builtin diagnostic seed: no DLC folder configured, skipping")
             return
 
-        root = _slopsmith_server_root()
+        root = _feedBack_server_root()
         dest_dir = dlc / _BUILTIN_DIAGNOSTIC_SUBDIR
         # Refuse a symlinked seed directory: mkdir(exist_ok=True) would accept
         # it and copies would land at the link target, outside the DLC tree.
@@ -3124,8 +3750,10 @@ def _background_scan():
         # path for playback.
         def _is_excluded_from_library(p: Path) -> bool:
             return "tutorials-builtin" in p.parts or "minigames-builtin" in p.parts
-        # Sloppaks: match both file (zip) and directory form by suffix.
-        sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
+        # Sloppaks: match both file (zip) and directory form, across both the
+        # `.feedpak` and legacy `.sloppak` suffixes.
+        _cands = sorted(p for ext in sloppak_mod.SONG_EXTS for p in dlc.rglob(f"*{ext}"))
+        sloppaks = [f for f in _cands
                     if sloppak_mod.is_sloppak(f)
                     and not _is_excluded_from_library(f)]
 
@@ -3143,7 +3771,7 @@ def _background_scan():
             if _is_excluded_from_library(wem):
                 continue
             d = wem.parent
-            if d in sloppak_dirs or d.name.lower().endswith(".sloppak"):
+            if d in sloppak_dirs or d.name.lower().endswith(sloppak_mod.SONG_EXTS):
                 continue
             if d not in seen_loose and loosefolder_mod.is_loose_song(d):
                 loose_songs.append(d)
@@ -3309,7 +3937,7 @@ async def startup_events():
     # phase so any frontend startup waiter that observes the lifespan also
     # unblocks cleanly (the SSE/poll client treats only `complete` and
     # `error` as terminal when `running` becomes false).
-    if _env_flag("SLOPSMITH_SKIP_STARTUP_TASKS"):
+    if _env_flag("FEEDBACK_SKIP_STARTUP_TASKS"):
         log.info("[startup] Skipping plugin load and background scan")
         # Tests pop `server` from sys.modules across runs, but the `plugins`
         # module is not reloaded — so LOADED_PLUGINS can carry stale entries
@@ -3324,7 +3952,7 @@ async def startup_events():
         _set_startup_status(
             running=False,
             phase="complete",
-            message="Startup tasks skipped (SLOPSMITH_SKIP_STARTUP_TASKS).",
+            message="Startup tasks skipped (FEEDBACK_SKIP_STARTUP_TASKS).",
             error=None,
             current_plugin="",
             loaded=0,
@@ -3380,7 +4008,7 @@ async def startup_events():
 
     # Load plugins asynchronously so HTTP routes and the desktop window can
     # come up immediately while heavy plugin imports/install steps continue.
-    _sync_mode = os.environ.get("SLOPSMITH_SYNC_STARTUP", "").lower() in {"1", "true", "yes", "on"}
+    _sync_mode = getenv_compat("FEEDBACK_SYNC_STARTUP", "").lower() in {"1", "true", "yes", "on"}
 
     def _load_plugins_background():
         try:
@@ -3569,7 +4197,7 @@ async def startup_events():
                          route_setup_fn=_route_setup_on_main)
             # Self-heal a freshly recreated container: its filesystem reset to
             # the image-baked sheet (in-tree plugins only), but a mounted
-            # SLOPSMITH_PLUGINS_DIR may carry user-installed plugins whose
+            # FEEDBACK_PLUGINS_DIR may carry user-installed plugins whose
             # classes aren't in it. Run in its OWN daemon thread so the startup
             # status can flip to "complete" immediately rather than waiting on
             # the (up to 120s) Tailwind subprocess. No-op when there are no user
@@ -3615,7 +4243,7 @@ async def startup_events():
         threading.Thread(target=_load_plugins_background, daemon=True).start()
 
     global _DEMO_JANITOR_STARTED, _DEMO_JANITOR_THREAD
-    if os.environ.get("SLOPSMITH_DEMO_MODE") == "1" and not _DEMO_JANITOR_STARTED:
+    if getenv_compat("FEEDBACK_DEMO_MODE") or getenv_compat("FEEDBACK_DEMO_MODE") == "1" and not _DEMO_JANITOR_STARTED:
         _DEMO_JANITOR_STARTED = True
         _DEMO_JANITOR_STOP.clear()
         def _janitor():
@@ -3722,7 +4350,7 @@ def get_version():
                 version = version_file.read_text().strip()
             except (OSError, UnicodeDecodeError):
                 pass
-    default_source_url = "https://github.com/got-feedback/feedback"
+    default_source_url = "https://github.com/got-feedback/feedBack"
     # APP_SOURCE_URL / APP_LICENSE_URL flow straight into <a href> in the UI,
     # so validate with urllib.parse rather than a bare prefix check — a prefix
     # check accepts malformed values like "https://" (no host) which produce
@@ -3827,7 +4455,7 @@ def trigger_full_rescan():
 
 # ── Song upload ───────────────────────────────────────────────────────────────
 
-_ALLOWED_SONG_EXTS = {".sloppak"}
+_ALLOWED_SONG_EXTS = set(sloppak_mod.SONG_EXTS)
 _MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB — covers sloppaks bundled with stems
 # Per-request batch cap. Lets a user drop a whole album of sloppaks at once
 # without giving a hostile client a 1000-file DoS surface via Starlette's
@@ -4058,7 +4686,7 @@ async def _save_uploaded_song(upload: UploadFile, dlc: Path, overwrite: bool) ->
     suffix = Path(base).suffix.lower()
     if suffix not in _ALLOWED_SONG_EXTS:
         return {"status": "error", "filename": base,
-                "error": "Only .sloppak files are accepted"}
+                "error": "Only .feedpak files are accepted"}
 
     dest = dlc / base
     if dest.exists():
@@ -4116,10 +4744,10 @@ async def _save_uploaded_song(upload: UploadFile, dlc: Path, overwrite: bool) ->
             if bytes_read == 0:
                 error_result = {"status": "error", "filename": base,
                                 "error": "Empty upload — file is 0 bytes"}
-            elif suffix == ".sloppak":
+            elif suffix in _ALLOWED_SONG_EXTS:
                 if head[:2] != b"PK":
                     error_result = {"status": "error", "filename": base,
-                                    "error": "Not a valid sloppak file (expected zip archive)"}
+                                    "error": "Not a valid feedpak file (expected zip archive)"}
                 else:
                     # ZIP magic alone admits any renamed zip — verify the sloppak
                     # loader can actually parse a manifest.yaml inside. Without
@@ -4322,11 +4950,21 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
                        arrangements_has: str = "", arrangements_lacks: str = "",
                        stems_has: str = "", stems_lacks: str = "",
                        has_lyrics: str = "", tunings: str = "", provider: str = "local",
-                       naming_mode: str = "legacy"):
-    """Paginated library search through the selected library provider."""
+                       after: str = "", naming_mode: str = "legacy"):
+    """Paginated library search through the selected library provider.
+
+    `after` is an opaque keyset cursor (feedBack#636 item 3): pass back the
+    `next_cursor` from the previous response to fetch the next page with a
+    WHERE-seek instead of OFFSET. Providers that don't support it ignore it and
+    page by OFFSET, so the client can always fall back."""
     size = min(size, 100)
     library_provider = _get_library_provider(provider)
     _require_library_provider_capability(library_provider, "library.read")
+    # Only the true local provider keysets: it's the one whose effective sort is
+    # exactly the request `sort`. A smart collection may pin its own sort and
+    # remote providers don't keyset — both must page by OFFSET, so never hand
+    # them a cursor (a mismatched one would mis-seek).
+    is_local = getattr(library_provider, "id", "") == "local"
     songs, total = await _call_library_provider_async(
         library_provider,
         "query_page",
@@ -4334,6 +4972,7 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
         size=size,
         sort=sort,
         direction=dir,
+        after=((after or None) if is_local else None),
         naming_mode=naming_mode,
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
@@ -4343,7 +4982,11 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
             has_lyrics=has_lyrics, tunings=tunings,
         ),
     )
-    return {"songs": songs, "total": total, "page": page, "size": size}
+    # The cursor to resume after this page (effective sort folds in dir=desc).
+    next_cursor = (next_library_cursor(_effective_keyset_sort(sort, dir), songs[-1])
+                   if (is_local and songs) else None)
+    return {"songs": songs, "total": total, "page": page, "size": size,
+            "next_cursor": next_cursor}
 
 
 @app.get("/api/library/artists")
@@ -4382,15 +5025,21 @@ async def library_stats(favorites: int = 0, q: str = "", format: str = "",
                         arrangements_has: str = "", arrangements_lacks: str = "",
                         stems_has: str = "", stems_lacks: str = "",
                         has_lyrics: str = "", tunings: str = "", provider: str = "local",
+                        sort: str = "artist", sort_letters: int = 0,
                         naming_mode: str = "legacy"):
     """Aggregate stats for the UI. Accepts the same filter params as
-    /api/library so the letter bar mirrors the active grid filter set."""
+    /api/library so the letter bar mirrors the active grid filter set.
+    `sort` selects the column the jump rail's `sort_letters` keys on;
+    `sort_letters=1` opts into that breakdown (the rail), so non-rail
+    callers skip the extra per-letter aggregate."""
     library_provider = _get_library_provider(provider)
     _require_library_provider_capability(library_provider, "library.read")
     return await _call_library_provider_async(
         library_provider,
         "query_stats",
         naming_mode=naming_mode,
+        sort=sort,
+        want_sort_letters=bool(sort_letters),
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
             artist=artist, album=album,
@@ -4406,7 +5055,7 @@ async def list_tuning_names(provider: str = "local"):
     """Distinct tuning names present in the library, with per-tuning
     counts. Powers the tuning multi-select. Sorted by `tuning_sort_key`
     so names appear in the same musical order the sort uses
-    (slopsmith#22) — E Standard first, then nearest neighbors."""
+    (feedBack#22) — E Standard first, then nearest neighbors."""
     library_provider = _get_library_provider(provider)
     _require_library_provider_capability(library_provider, "library.read")
     return await _call_library_provider_async(library_provider, "tuning_names")
@@ -4852,6 +5501,10 @@ def api_record_stats(data: dict):
     filename = _clean_str(data.get("filename"))
     if not filename:
         return JSONResponse({"error": "filename required"}, status_code=400)
+    # The recorder hands us URL-encoded filenames; canonicalize to the library
+    # key so stored rows line up with `songs` (and so the arrangement-count bound
+    # below resolves the real song). See MetadataDB._canonical_song_filename.
+    filename = meta_db._canonical_song_filename(filename)
     arr_raw = data.get("arrangement", 0)
     if arr_raw is None:
         arrangement = 0
@@ -5006,6 +5659,28 @@ def api_stats_best():
     return meta_db.best_accuracy_map()
 
 
+@app.get("/api/stats/top")
+def api_top_stats(limit: int = 5):
+    """Top scored songs (best first), joined to song metadata, for the profile
+    'Your best scores' panel (defined before the {filename} catch-all)."""
+    from urllib.parse import quote
+    out = []
+    for r in meta_db.top_stats(limit):
+        meta = meta_db.conn.execute(
+            "SELECT title, artist, tuning_name FROM songs WHERE filename = ?",
+            (r["filename"],),
+        ).fetchone()
+        title, artist, tuning_name = meta if meta else (None, None, None)
+        out.append({
+            **r,
+            "title": title or r["filename"],
+            "artist": artist or "",
+            "tuning_name": tuning_name or "",
+            "art_url": f"/api/song/{quote(r['filename'])}/art",
+        })
+    return out
+
+
 @app.get("/api/stats/{filename:path}")
 def api_song_stats(filename: str):
     return meta_db.get_song_stats(filename)
@@ -5013,9 +5688,35 @@ def api_song_stats(filename: str):
 
 # ── Playlists / Saved for Later / Continue-Playing (fee[dB]ack v0.3.0) ────────
 
+def _playlist_cover_path(pid) -> Path | None:
+    """Filesystem path of a playlist's optional custom cover image (PNG),
+    stored under CONFIG_DIR. Returns None for a non-integer id."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    return CONFIG_DIR / "playlist_covers" / f"{pid}.png"
+
+
+def _playlist_cover_url(pid) -> str | None:
+    cover = _playlist_cover_path(pid)
+    if not cover or not cover.exists():
+        return None
+    try:
+        # Nanosecond mtime so a same-second replace/remove/re-upload still
+        # changes the cache-bust token (int seconds could collide → stale image).
+        mt = cover.stat().st_mtime_ns
+    except OSError:
+        mt = 0
+    return f"/api/playlists/{pid}/cover?v={mt}"
+
+
 @app.get("/api/playlists")
 def api_list_playlists():
-    return meta_db.list_playlists()
+    lists = meta_db.list_playlists()
+    for pl in lists:
+        pl["cover_url"] = _playlist_cover_url(pl["id"])
+    return lists
 
 
 @app.post("/api/playlists")
@@ -5031,6 +5732,7 @@ def api_get_playlist(pid: int):
     pl = meta_db.get_playlist(pid)
     if pl is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    pl["cover_url"] = _playlist_cover_url(pid)
     return pl
 
 
@@ -5057,6 +5759,12 @@ def api_delete_playlist(pid: int):
         return JSONResponse({"error": "System playlists cannot be deleted."}, status_code=400)
     if not meta_db.delete_playlist(pid):   # vanished under us (concurrent delete)
         return JSONResponse({"error": "not found"}, status_code=404)
+    cover = _playlist_cover_path(pid)       # drop any custom cover with the playlist
+    if cover and cover.exists():
+        try:
+            cover.unlink()
+        except OSError:
+            pass
     return {"ok": True}
 
 
@@ -5103,6 +5811,111 @@ def api_reorder_playlist(pid: int, data: dict):
     return meta_db.get_playlist(pid)
 
 
+@app.post("/api/playlists/{pid}/cover")
+async def api_set_playlist_cover(pid: int, data: dict):
+    """Set a playlist's custom cover from a base64 / data-URL image (PNG/JPG).
+    Overrides the content-dependent (song-art) cover. Stored as a small PNG
+    thumbnail under CONFIG_DIR/playlist_covers/."""
+    if meta_db.get_playlist(pid) is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    import base64
+    import io
+    b64 = data.get("image", "")
+    # Guard the type before the `","` membership test — a non-string image
+    # (e.g. {"image": 123} / null) would otherwise raise TypeError → 500.
+    # Mirrors the avatar/song-art upload guard.
+    if not isinstance(b64, str) or not b64:
+        return JSONResponse({"error": "No image data"}, status_code=400)
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    if not b64:
+        return JSONResponse({"error": "No image data"}, status_code=400)
+    try:
+        img_data = base64.b64decode(b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64"}, status_code=400)
+    cover = _playlist_cover_path(pid)
+    cover.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        img.thumbnail((640, 640))                  # covers stay small
+        tmp = cover.with_suffix(".png.tmp")
+        img.save(str(tmp), "PNG")
+        tmp.replace(cover)
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid image: {e}"}, status_code=400)
+    return {"ok": True, "cover_url": _playlist_cover_url(pid)}
+
+
+@app.get("/api/playlists/{pid}/cover")
+def api_get_playlist_cover(pid: int):
+    cover = _playlist_cover_path(pid)
+    if not cover or not cover.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # no-cache (revalidate) like song art, so a replaced cover is never served
+    # stale — pairs with the mtime-ns cache-bust token on the URL.
+    return FileResponse(str(cover), media_type="image/png", headers=_ART_CACHE_HEADERS)
+
+
+@app.delete("/api/playlists/{pid}/cover")
+def api_delete_playlist_cover(pid: int):
+    cover = _playlist_cover_path(pid)
+    if cover and cover.exists():
+        try:
+            cover.unlink()
+        except OSError:
+            pass
+    return {"ok": True}
+
+
+# ── Smart collections API (feedBack#636 item 2) ───────────────────────────────
+# (rule schema + `_sanitize_collection_rules` are defined with the provider.)
+
+@app.get("/api/collections")
+def api_list_collections():
+    """Smart/dynamic collections (saved live library filters)."""
+    return {"collections": meta_db.list_collections()}
+
+
+@app.post("/api/collections")
+def api_create_collection(data: dict):
+    """Create a collection from a name + a set of library filter rules. It
+    immediately appears as a source in the library provider picker."""
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    name = _clean_str(data.get("name"))
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    col = meta_db.create_collection(name, _sanitize_collection_rules(data.get("rules")))
+    _sync_collection_provider(col)
+    return {"ok": True, "collection": col}
+
+
+@app.put("/api/collections/{pid}")
+def api_update_collection(pid: int, data: dict):
+    """Rename a collection and/or replace its rules."""
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    name = _clean_str(data.get("name")) or None
+    rules = _sanitize_collection_rules(data["rules"]) if "rules" in data else None
+    col = meta_db.update_collection(pid, name=name, rules=rules)
+    if col is None:
+        return JSONResponse({"error": "collection not found"}, status_code=404)
+    _sync_collection_provider(col)
+    return {"ok": True, "collection": col}
+
+
+@app.delete("/api/collections/{pid}")
+def api_delete_collection(pid: int):
+    """Delete a collection and unregister its provider."""
+    if not meta_db.is_collection(pid):
+        return JSONResponse({"error": "collection not found"}, status_code=404)
+    meta_db.delete_playlist(pid)
+    _unregister_collection_provider(pid)
+    return {"ok": True}
+
+
 @app.post("/api/saved/toggle")
 def api_toggle_saved(data: dict):
     """Add/remove a song on the reserved Saved-for-Later playlist."""
@@ -5116,6 +5929,40 @@ def api_toggle_saved(data: dict):
 def api_session_continue():
     """The Continue-Playing card's song (most recent play) or null."""
     return meta_db.continue_session()
+
+
+# ── Wishlist / "wanted" API (feedBack#636 item 4) ─────────────────────────────
+
+@app.get("/api/wanted")
+def api_list_wanted():
+    """The wishlist — songs the user wants but doesn't own yet (newest first)."""
+    return {"wanted": meta_db.list_wanted()}
+
+
+@app.post("/api/wanted")
+def api_add_wanted(data: dict):
+    """Add a not-owned song to the wishlist. `artist`/`title` are required (at
+    least one non-empty); `source`/`source_ref`/`note` are optional. Idempotent
+    on identity so producers (find_more ownership-diff, manual add) can re-post."""
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    artist = _clean_str(data.get("artist"))
+    title = _clean_str(data.get("title"))
+    if not artist and not title:
+        return JSONResponse({"error": "artist or title required"}, status_code=400)
+    row = meta_db.add_wanted(
+        artist=artist, title=title,
+        source=_clean_str(data.get("source")) or "manual",
+        source_ref=_clean_str(data.get("source_ref")),
+        note=_clean_str(data.get("note")),
+    )
+    return {"ok": True, "wanted": row}
+
+
+@app.delete("/api/wanted/{wanted_id}")
+def api_remove_wanted(wanted_id: int):
+    """Remove a wishlist entry by id."""
+    return {"ok": meta_db.remove_wanted(wanted_id)}
 
 
 # ── Loops API ────────────────────────────────────────────────────────────────
@@ -5244,6 +6091,28 @@ def _default_settings():
     # silently undoing the env-var fix on the next load.
     return {
         "dlc_dir": str(DLC_DIR) if (_DLC_DIR_ENV and DLC_DIR.is_dir()) else "",
+        # fee[dB]ack v0.3.0 gameplay settings (tabbed settings page). Each
+        # defaults to its neutral / off value so existing users see no
+        # behaviour change until they opt in. countdown_before_song is wired
+        # into the song-start path; miss_penalty / fail_behavior are persisted
+        # but not yet consumed by scoring (stub rows on the Gameplay tab).
+        "countdown_before_song": False,
+        "miss_penalty": "none",
+        "fail_behavior": "continue",
+        # Achievements epic: opt-in to publishing earned Feats (name + Feat id
+        # only) to the hosted wall. Default OFF — nothing leaves the device
+        # until the user opts in. Read by the bundled achievements plugin to
+        # gate its wall-sync enqueue.
+        "achievements_enabled": False,
+        # Amp-sim opt-in (issue feedBack-desktop#46). Whether the desktop app may
+        # auto-load an in-app amp-sim / tone chain (NAM / IR / VST) for input
+        # monitoring. Default OFF — "own-rig first": players monitoring through
+        # their own external amp/rig never get a processed monitor (and never the
+        # idle distorted buzz) until they opt in. Set during onboarding (desktop
+        # only) and from the desktop Audio settings toggle; read by the desktop
+        # renderer to gate its saved-chain restore. Inert on the pure-web build,
+        # which has no native amp sims.
+        "use_amp_sims": False,
     }
 
 
@@ -5315,8 +6184,9 @@ def save_settings(data: dict):
         else:
             if Path(dlc_path).is_dir():
                 updates["dlc_dir"] = dlc_path
-                count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".sloppak")
-                messages.append(f"DLC folder: {count} sloppak files found")
+                count = sum(1 for f in Path(dlc_path).iterdir()
+                            if f.suffix.lower() in sloppak_mod.SONG_EXTS)
+                messages.append(f"DLC folder: {count} song files found")
             else:
                 return {"error": f"DLC directory not found: {dlc_path}"}
 
@@ -5368,6 +6238,41 @@ def save_settings(data: dict):
             updates["av_offset_ms"] = max(-1000.0, min(1000.0, float(raw)))
         except (TypeError, ValueError, OverflowError):
             return {"error": "av_offset_ms must be a number between -1000 and 1000"}
+
+    # fee[dB]ack v0.3.0 gameplay settings (tabbed settings page). null is a
+    # no-op per the merge contract; bad shapes return a structured error
+    # rather than 500. countdown_before_song is consumed by the song-start
+    # count-in; miss_penalty / fail_behavior are persisted-only stubs.
+    if "countdown_before_song" in data:
+        raw = data["countdown_before_song"]
+        if raw is not None:
+            if not isinstance(raw, bool):
+                return {"error": "countdown_before_song must be a boolean"}
+            updates["countdown_before_song"] = raw
+    if "achievements_enabled" in data:
+        raw = data["achievements_enabled"]
+        if raw is not None:
+            if not isinstance(raw, bool):
+                return {"error": "achievements_enabled must be a boolean"}
+            updates["achievements_enabled"] = raw
+    if "use_amp_sims" in data:
+        raw = data["use_amp_sims"]
+        if raw is not None:
+            if not isinstance(raw, bool):
+                return {"error": "use_amp_sims must be a boolean"}
+            updates["use_amp_sims"] = raw
+    if "miss_penalty" in data:
+        raw = data["miss_penalty"]
+        if raw is not None:
+            if not isinstance(raw, str) or raw not in ("none", "low", "medium", "high"):
+                return {"error": "miss_penalty must be one of none, low, medium, high"}
+            updates["miss_penalty"] = raw
+    if "fail_behavior" in data:
+        raw = data["fail_behavior"]
+        if raw is not None:
+            if not isinstance(raw, str) or raw not in ("continue", "restart", "stop"):
+                return {"error": "fail_behavior must be one of continue, restart, stop"}
+            updates["fail_behavior"] = raw
 
     # fee[dB]ack v0.3.0 — tuner reference pitch + instrument selection.
     # These drive the topbar tuner/instrument badges and (when installed) the
@@ -5438,7 +6343,43 @@ def save_settings(data: dict):
     return {"message": ". ".join(messages) if messages else "Settings saved"}
 
 
-# ── Settings export/import (slopsmith#113) ───────────────────────────────────
+# Keys a client "Reset {category}" action may clear. Resetting removes the key
+# from config.json so the next GET falls back to the _default_settings() value
+# (or the frontend's own default when the key is then absent). Restricting to a
+# known set means a malformed or hostile body can't wipe unrelated config.
+_RESETTABLE_SETTINGS_KEYS = frozenset({
+    "default_arrangement", "demucs_server_url", "master_difficulty",
+    "av_offset_ms", "countdown_before_song", "miss_penalty", "fail_behavior",
+    "reference_pitch", "instrument", "string_count", "tuning",
+    "achievements_enabled", "use_amp_sims",
+})
+
+
+@app.post("/api/settings/reset")
+def reset_settings(data: dict):
+    """Clear the given settings keys back to their defaults — backs the
+    per-category "Reset" buttons on the tabbed settings page. Unknown keys are
+    ignored (not an error) so a newer client asking to reset a key an older
+    server doesn't recognise degrades gracefully. Shares _settings_lock with
+    save_settings()/import for the same read-merge-write atomicity reason."""
+    raw_keys = data.get("keys")
+    if not isinstance(raw_keys, list):
+        return {"error": "keys must be a list of setting names"}
+    keys = [k for k in raw_keys if isinstance(k, str) and k in _RESETTABLE_SETTINGS_KEYS]
+    config_file = CONFIG_DIR / "config.json"
+    with _settings_lock:
+        cfg = _load_config(config_file)
+        if cfg is None:
+            # Nothing persisted yet — already at defaults.
+            return {"message": "Settings reset", "reset": []}
+        removed = [k for k in keys if k in cfg]
+        for k in removed:
+            del cfg[k]
+        _atomic_write_file(config_file, json.dumps(cfg, indent=2).encode("utf-8"))
+    return {"message": "Settings reset", "reset": removed}
+
+
+# ── Settings export/import (feedBack#113) ───────────────────────────────────
 
 # Bumped only when the bundle JSON shape changes incompatibly. Importer
 # refuses anything but this exact value — version mismatches are warned
@@ -5806,11 +6747,87 @@ def _atomic_write_file(target: Path, payload: bytes):
         raise
 
 
+# Core (non-plugin) server-side state that the settings bundle backs up
+# alongside config.json. The library DB is the only state a rescan can't
+# rebuild (scores, favorites, playlists, play history); the art dirs hold
+# custom playlist covers + the user avatar. `web_library.db` is handled
+# specially (consistent snapshot on export, staged restore on import) — the
+# art dirs are walked like plugin export paths. NOTE: custom uploaded
+# *song* art currently lands in `art_cache/` commingled with the derived
+# (rebuildable) cache, so it is intentionally NOT bundled here to avoid
+# bloating the backup with regenerable thumbnails — splitting custom song
+# art into its own dir is a tracked follow-up (got-feedback/feedBack#636).
+_CORE_LIBRARY_DB = "web_library.db"
+_CORE_EXPORT_ART_DIRS = ("playlist_covers/", "avatars/")
+_CORE_IMPORT_ALLOWED = (_CORE_LIBRARY_DB,) + _CORE_EXPORT_ART_DIRS
+
+
+def _snapshot_library_db() -> dict | None:
+    """A consistent, fully-checkpointed single-file copy of the live library
+    DB, base64-encoded for the bundle. Uses the SQLite online-backup API so
+    it is safe to call while the server is serving requests; the live write
+    lock is held for the copy so no write lands mid-snapshot. Returns None if
+    the DB or backup is unavailable (export proceeds without it)."""
+    import base64
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix="._dbsnap.", suffix=".db")
+    os.close(fd)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            with meta_db._lock:
+                meta_db.conn.backup(dst)
+        finally:
+            dst.close()
+        raw = Path(tmp).read_bytes()
+    except (sqlite3.Error, OSError):
+        log.warning("library DB snapshot for settings export failed", exc_info=True)
+        return None
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(tmp + suffix).unlink()
+            except FileNotFoundError:
+                pass
+    return {"encoding": "base64", "data": base64.b64encode(raw).decode("ascii")}
+
+
+def _sqlite_payload_integrity_ok(payload: bytes) -> bool:
+    """Validate decoded DB bytes by materializing them to a temp file and
+    running the same integrity probe used at restore time — so a corrupt or
+    truncated snapshot is refused at import, before it's ever staged."""
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix="._dbcheck.", suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        return _sqlite_file_integrity_ok(Path(tmp))
+    except OSError:
+        return False
+    finally:
+        try:
+            Path(tmp).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _core_server_files() -> dict | None:
+    """`{relpath: encoded_entry}` for core server-side state in the bundle:
+    a snapshot of the library DB plus any custom playlist covers / avatar.
+    Returns None if the DB snapshot could not be produced — the caller must
+    treat that as a hard export failure rather than silently shipping a
+    backup that's missing the irreplaceable library state."""
+    snap = _snapshot_library_db()
+    if snap is None:
+        return None
+    out: dict[str, dict] = dict(_walk_export_paths(list(_CORE_EXPORT_ART_DIRS), CONFIG_DIR))
+    out[_CORE_LIBRARY_DB] = snap
+    return out
+
+
 @app.get("/api/settings/export")
 def export_settings():
     """Build a settings bundle covering server config + opted-in plugin
     server-side files. Frontend layers in `local_storage` before
-    triggering the download. See slopsmith#113."""
+    triggering the download. See feedBack#113."""
     import datetime
     from plugins import LOADED_PLUGINS, PLUGINS_LOCK
 
@@ -5818,6 +6835,17 @@ def export_settings():
     server_config = _load_config(config_file)
     if server_config is None:
         server_config = _default_settings()
+
+    # Snapshot the library DB + custom art FIRST: if the irreplaceable state
+    # can't be captured, abort with an error rather than hand back a bundle
+    # that looks like a backup but silently omits it.
+    core_files = _core_server_files()
+    if core_files is None:
+        return JSONResponse(
+            {"ok": False, "error": "could not snapshot the library database; "
+                                   "export aborted to avoid an incomplete backup"},
+            status_code=500,
+        )
 
     plugin_blocks: dict[str, dict] = {}
     with PLUGINS_LOCK:
@@ -5833,11 +6861,12 @@ def export_settings():
     bundle = {
         "schema": SETTINGS_BUNDLE_SCHEMA,
         "exported_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "slopsmith_version": _running_version(),
+        "feedBack_version": _running_version(),
         "server_config": server_config,
         "plugin_server_configs": plugin_blocks,
+        "core_server_files": core_files,
     }
-    filename = f"slopsmith-settings-{now.strftime('%Y-%m-%d')}.json"
+    filename = f"feedBack-settings-{now.strftime('%Y-%m-%d')}.json"
     return JSONResponse(
         bundle,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
@@ -5849,7 +6878,7 @@ def import_settings(bundle: dict):
     """Apply a previously exported settings bundle. Validates the entire
     bundle in phase 1 (no disk writes); only on full success does
     phase 2 commit each file via temp+rename. The frontend reads
-    `local_storage` itself — server ignores it. See slopsmith#113."""
+    `local_storage` itself — server ignores it. See feedBack#113."""
     from plugins import LOADED_PLUGINS, PLUGINS_LOCK
 
     if not isinstance(bundle, dict):
@@ -5887,7 +6916,7 @@ def import_settings(bundle: dict):
         )
 
     warnings: list[str] = []
-    bundle_version = bundle.get("slopsmith_version")
+    bundle_version = bundle.get("feedBack_version")
     running = _running_version()
     if bundle_version and bundle_version != running:
         warnings.append(
@@ -5975,6 +7004,62 @@ def import_settings(bundle: dict):
         if applied_for_plugin:
             applied_plugins.append(plugin_id)
 
+    # ── Core server-side files (library DB + custom art) ─────────────
+    core_blocks = bundle.get("core_server_files") or {}
+    if not isinstance(core_blocks, dict):
+        return JSONResponse(
+            {"ok": False, "error": "core_server_files must be an object"},
+            status_code=400,
+        )
+    db_restore_staged = False
+    applied_core: list[str] = []
+    for relpath, file_entry in core_blocks.items():
+        if not isinstance(relpath, str) or not relpath:
+            return JSONResponse(
+                {"ok": False, "error": f"core_server_files: invalid relpath key {relpath!r}"},
+                status_code=400,
+            )
+        if relpath == _CORE_LIBRARY_DB:
+            # Stage the DB beside the live one; the swap happens at next
+            # startup (_apply_pending_db_restore), so we never overwrite a DB
+            # the server holds open or strand a stale WAL against a fresh file.
+            target = CONFIG_DIR / (_CORE_LIBRARY_DB + ".restore")
+            db_restore_staged = True
+        else:
+            try:
+                target = _validate_relpath(relpath, list(_CORE_IMPORT_ALLOWED), CONFIG_DIR)
+            except _UndeclaredFile:
+                warnings.append(f"core_server_files: skipped undeclared path {relpath!r}")
+                continue
+            except ValueError as e:
+                return JSONResponse(
+                    {"ok": False, "error": f"core_server_files, file {relpath!r}: {e}"},
+                    status_code=400,
+                )
+        try:
+            payload = _decode_entry(file_entry)
+        except ValueError as e:
+            return JSONResponse(
+                {"ok": False, "error": f"core_server_files, file {relpath!r}: {e}"},
+                status_code=400,
+            )
+        # Guard the DB payload: a truncated/corrupt file staged as the restore
+        # would fail to open at startup and brick the app (after the live DB
+        # is already gone). Reject anything that doesn't open + pass
+        # quick_check before it's ever staged.
+        if relpath == _CORE_LIBRARY_DB and not _sqlite_payload_integrity_ok(payload):
+            return JSONResponse(
+                {"ok": False, "error": "core_server_files: web_library.db is not a valid SQLite database"},
+                status_code=400,
+            )
+        staged.append((f"core/{relpath}", target, payload))
+        applied_core.append(relpath)
+    if db_restore_staged:
+        warnings.append(
+            "library database restored; restart FeedBack to load it "
+            "(scores, favorites, playlists, and play history)"
+        )
+
     # ── Phase 2: commit ──────────────────────────────────────────────
     written: list[str] = []
     try:
@@ -6001,6 +7086,15 @@ def import_settings(bundle: dict):
         # because we didn't snapshot them — surface what got written
         # (as relpaths, not absolute server paths) so the user knows
         # the state is partial without leaking deployment layout.
+        # Disarm a staged DB restore THIS request wrote: a partial import must
+        # NOT silently swap the library DB on the next restart. Gate on the
+        # write actually having happened (display key in `written`) so we don't
+        # delete a valid restore staged by a prior, not-yet-applied import.
+        if f"core/{_CORE_LIBRARY_DB}" in written:
+            try:
+                (CONFIG_DIR / (_CORE_LIBRARY_DB + ".restore")).unlink()
+            except FileNotFoundError:
+                pass
         return JSONResponse(
             {
                 "ok": False,
@@ -6016,11 +7110,13 @@ def import_settings(bundle: dict):
         "applied": {
             "server_config": True,
             "plugins": applied_plugins,
+            "core_files": applied_core,
         },
+        "restart_required": db_restore_staged,
     }
 
 
-# ── Diagnostic bundle export (slopsmith#166) ──────────────────────────
+# ── Diagnostic bundle export (feedBack#166) ──────────────────────────
 #
 # One-click "Export Diagnostics" in Settings produces a redacted zip
 # combining server logs, system info, hardware (CPU/GPU/RAM), plugin
@@ -6044,11 +7140,11 @@ def _diag_plugins_roots() -> list[Path]:
     """Return all plugin root directories for orphan scanning.
 
     Includes both the built-in ``plugins/`` directory and
-    ``SLOPSMITH_PLUGINS_DIR`` when set, so user-installed plugins and
+    ``FEEDBACK_PLUGINS_DIR`` when set, so user-installed plugins and
     orphans in the external dir are reflected in the bundle.
     """
     roots: list[Path] = []
-    user_dir = os.environ.get("SLOPSMITH_PLUGINS_DIR", "").strip()
+    user_dir = getenv_compat("FEEDBACK_PLUGINS_DIR", "").strip()
     if user_dir:
         p = Path(user_dir)
         if p.is_dir():
@@ -6228,7 +7324,7 @@ def export_diagnostics(payload: dict = Body(default_factory=dict)):
     )
 
     zip_bytes, filename, _manifest = _diag_build(
-        slopsmith_version=_running_version(),
+        feedBack_version=_running_version(),
         config_dir=CONFIG_DIR,
         dlc_dir=_get_dlc_dir(),
         log_file=_diag_log_file(),
@@ -6274,7 +7370,7 @@ def preview_diagnostics(
     with PLUGINS_LOCK:
         plugins_snapshot = list(LOADED_PLUGINS)
     return _diag_preview(
-        slopsmith_version=_running_version(),
+        feedBack_version=_running_version(),
         config_dir=CONFIG_DIR,
         dlc_dir=_get_dlc_dir(),
         log_file=_diag_log_file(),
@@ -6746,15 +7842,63 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
         if 0 <= arrangement < len(song.arrangements):
             best = arrangement
         else:
-            # Check user's default arrangement preference
+            # Read the user's config once: their selected instrument (route the chart
+            # to the matching part) and their default-arrangement preference.
             pref = ""
+            sel_instrument = ""
             config_file = CONFIG_DIR / "config.json"
             if config_file.exists():
                 try:
-                    pref = json.loads(config_file.read_text(encoding="utf-8")).get("default_arrangement", "")
+                    _cfg = json.loads(config_file.read_text(encoding="utf-8"))
+                    pref = _cfg.get("default_arrangement", "")
+                    sel_instrument = (_cfg.get("instrument", "") or "")
                 except Exception:
                     pass
-            if pref:
+            # Instrument routing: load the part that matches the selected instrument so
+            # "your instrument" and "the chart you play" line up. The default ordering
+            # is Lead/guitar-first, so without this a bass player gets handed a guitar
+            # chart (and any tune-check then compares a 4-string bass against a 6-string
+            # part). Currently routes bass -> a Bass arrangement; guitar — and any
+            # unknown/future instrument (drums, keys) — falls through to the
+            # preference/most-notes logic below, which already lands on a guitar part.
+            # Drums/keys get their own match when those arrangement types + selector
+            # entries land. Only applies when no explicit arrangement was requested, so
+            # a manual arrangement switch is always respected.
+            if sel_instrument.lower() == "bass":
+                # Candidate bass parts, preferring the structured pathBass flag; the
+                # normalized smart name (itself pathBass-derived) and raw name are
+                # fallbacks for sources without the flag.
+                bass_idxs = [
+                    i
+                    for i, a in enumerate(song.arrangements)
+                    if getattr(a, "path_bass", False)
+                    or (smart_names[i] or "").lower().startswith("bass")
+                    or "bass" in (getattr(a, "name", "") or "").lower()
+                ]
+                if bass_idxs:
+                    # Among the bass parts: (1) honor the saved default-arrangement
+                    # preference if it names one of them (so a bass player who prefers
+                    # "Bass 2"/"Alt. Bass" keeps it), (2) else the canonical main "Bass",
+                    # (3) else the first bass part in order.
+                    pref_bass = -1
+                    if pref:
+                        for i in bass_idxs:
+                            nm = (smart_names[i] if naming_mode == "smart" and i < len(smart_names)
+                                  else getattr(song.arrangements[i], "name", ""))
+                            if nm == pref:
+                                pref_bass = i
+                                break
+                    if pref_bass >= 0:
+                        best = pref_bass
+                    else:
+                        best = next(
+                            (i for i in bass_idxs
+                             if (smart_names[i] if i < len(smart_names) else "") == "Bass"),
+                            bass_idxs[0],
+                        )
+            # User's default arrangement preference (only when instrument routing did not
+            # already resolve a part — i.e. guitar, or a bass player with no bass part).
+            if best < 0 and pref:
                 if naming_mode == "smart":
                     best = _pick_smart_arrangement(song.arrangements, smart_names, pref)
                 else:
@@ -6787,6 +7931,11 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
         audio_url = None
         audio_error: str | None = None  # Surfaced in song_info when audio_url is None
         stems_payload: list[dict] = []
+        # URL of the single full-mix audio (sloppak `original_audio:`), when the
+        # pack ships one. The stems plugin uses this to play the untouched mix
+        # while every stem slider is at unity; None otherwise (separate stems
+        # only, loose folder, or archive).
+        original_audio_url: str | None = None
         if is_loose:
             # Loose folder filenames are relative paths (artist/album/song).
             # Hash the *canonical* dlc-relative path (so two URL spellings
@@ -6825,8 +7974,22 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
             for s in loaded_slop.stems:
                 url = f"/api/sloppak/{q_fn}/file/{quote(s['file'])}"
                 stems_payload.append({"id": s["id"], "url": url, "default": s["default"]})
+            # Full-mix URL (served by the same /api/sloppak/.../file/ endpoint).
+            if loaded_slop is not None and loaded_slop.original_audio:
+                original_audio_url = (
+                    f"/api/sloppak/{q_fn}/file/{quote(loaded_slop.original_audio)}"
+                )
             if stems_payload:
+                # Stems present: keep the core <audio> pointed at stem[0]. This
+                # URL is only ever heard in the degraded path (stems plugin
+                # refuses takeover / decode fails); the full-mix↔stems switch is
+                # driven client-side by `original_audio_url`, not `audio_url`.
                 audio_url = stems_payload[0]["url"]
+            elif original_audio_url:
+                # Stem-less full-mix pack: nothing to separate, so play the full
+                # mix natively through the core <audio>. The stems plugin's
+                # onSongReady returns early on an empty stems list (no graph).
+                audio_url = original_audio_url
             else:
                 audio_error = "This sloppak has no playable stems."
         else:
@@ -6941,7 +8104,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
             "audio_error": audio_error,
             "tuning": arr.tuning,
             # Number of strings on the active arrangement
-            # (slopsmith-plugin-3dhighway#7). arrangement XML / archive sources
+            # (feedBack-plugin-3dhighway#7). arrangement XML / archive sources
             # always emit `tuning` as length 6 with zero-padding for
             # unused string slots, so `len(arr.tuning)` is unreliable
             # there; sloppak / GP-imported sources may instead carry
@@ -6961,7 +8124,23 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
             # and break the frontend's song_info parsing.
             "offset": _sanitized_song_offset(song) if is_loose else 0.0,
             "format": "sloppak" if is_slop else ("loose" if is_loose else "archive"),
+            # Feedpak contributor credits (manifest `authors:`, spec §5.4) —
+            # name + role only, shown on the highway when a song is loaded.
+            # Only sloppak/feedpak packs carry a manifest; loose/archive
+            # sources get []. The frontend uses a non-empty list as the gate
+            # for the credits overlay, so minigames / synthetic highway uses
+            # (no manifest) never trigger it.
+            "authors": _sanitize_authors(loaded_slop.manifest) if (is_slop and loaded_slop is not None) else [],
             "stems": stems_payload,
+            # Full-mix audio (sloppak `original_audio:`) served alongside the
+            # separate `stems`. The stems plugin plays this single file while
+            # every stem slider is at unity and switches to the separate stems
+            # the moment one drops below 100%. None when the pack ships stems
+            # only. `has_*` flags mirror the has_drum_tab/has_keys convention so
+            # a client can branch without re-deriving from the URLs.
+            "original_audio_url": original_audio_url,
+            "has_original_audio": bool(original_audio_url),
+            "has_stems": bool(stems_payload),
             # Surface a drum_tab presence flag so the visualization picker
             # can auto-activate the drums plugin even when the chosen
             # arrangement isn't named "Drums" (drum_tab.json lives next
@@ -7362,8 +8541,48 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
                         "data": [],
                     })
 
+        # Teaching mark sd (§6.2.2): derive each note's scale degree from the
+        # active key (keys.json §7.7) + its sounding pitch (tuning[string] +
+        # fret), only when the author didn't author one. Display/teaching only —
+        # NEVER feeds grading. Notes whose string/fret has no tuning entry, or
+        # that have no active key, or whose key name is unparseable, stay unset.
+        _key_events = (
+            (loaded_slop.keys.get("events") or [])
+            if (is_slop and loaded_slop is not None and loaded_slop.keys is not None)
+            else []
+        )
+        _key_times = [e["t"] for e in _key_events]
+        _key_tonics = [key_to_tonic_pc(e.get("key")) for e in _key_events]
+        _tuning = arr.tuning or []
+        # Hoist the open-string base out of the per-note loop: arr.tuning holds
+        # per-string OFFSETS from standard, so the sounding pitch is
+        # base[string] + offset + capo + fret (matches the tuner / open-string
+        # labels). arrangement_string_count is O(notes), so compute once here.
+        _base = base_open_string_midis(
+            arrangement_string_count(arr), "bass" in (arr.name or "").lower())
+        _capo = int(getattr(arr, "capo", 0) or 0)
+
+        def _fill_scale_degree(wire: dict, n, t: float) -> None:
+            # Author-provided sd wins — note_to_wire already emitted it.
+            if "sd" in wire or not _key_times:
+                return
+            idx = bisect.bisect_right(_key_times, t) - 1
+            if idx < 0:
+                return
+            tonic = _key_tonics[idx]
+            if tonic is None:
+                return
+            midi = pitch_from_base(_base, _capo, _tuning, n.string, n.fret)
+            if midi is None:
+                return
+            wire["sd"] = scale_degree_for_pitch(midi, tonic)
+
         # Send notes in chunks
-        notes = [note_to_wire(n) for n in arr.notes]
+        notes = []
+        for n in arr.notes:
+            w = note_to_wire(n)
+            _fill_scale_degree(w, n, n.time)
+            notes.append(w)
         # Send in chunks of 500
         for i in range(0, len(notes), 500):
             await websocket.send_json({
@@ -7373,7 +8592,12 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
             })
 
         # Send chords
-        chords = [chord_to_wire(c) for c in arr.chords]
+        chords = []
+        for c in arr.chords:
+            cw = chord_to_wire(c)
+            for cn, cnw in zip(c.notes, cw.get("notes", [])):
+                _fill_scale_degree(cnw, cn, c.time)
+            chords.append(cw)
         for i in range(0, len(chords), 500):
             await websocket.send_json({
                 "type": "chords",
@@ -7390,7 +8614,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1,
             })
 
         # Per-phrase difficulty data for the master-difficulty slider
-        # (slopsmith#48). Only sent when the source chart had multiple
+        # (feedBack#48). Only sent when the source chart had multiple
         # `<level>` tiers — single-level charts (GP converter, older
         # sloppaks without phrase data) produce arr.phrases=None, and the
         # frontend treats the missing message as "slider disabled".
@@ -7501,9 +8725,9 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 def index():
     # fee[dB]ack v0.3.0: the v3 shell is now the DEFAULT at `/`. The classic v2
     # UI remains fully available as a fallback — opt back in with
-    # SLOPSMITH_UI=v2 (or =legacy), or hit the dedicated /v2 route below (which
+    # FEEDBACK_UI=v2 (or =legacy), or hit the dedicated /v2 route below (which
     # serves it regardless of the env var).
-    if os.environ.get("SLOPSMITH_UI") in ("v2", "legacy"):
+    if getenv_compat("FEEDBACK_UI") or getenv_compat("FEEDBACK_UI") in ("v2", "legacy"):
         return FileResponse(str(STATIC_DIR / "index.html"))
     return FileResponse(str(STATIC_DIR / "v3" / "index.html"))
 
@@ -7518,5 +8742,5 @@ def index_v3():
 @app.get("/v2")
 def index_v2():
     # Always serve the classic v2 UI, independent of the env var, so the
-    # fallback is reachable without flipping SLOPSMITH_UI.
+    # fallback is reachable without flipping FEEDBACK_UI.
     return FileResponse(str(STATIC_DIR / "index.html"))

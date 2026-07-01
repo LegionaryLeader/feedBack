@@ -1,5 +1,6 @@
 """Convert Guitar Pro files (.gp5/.gp4/.gp3) to arrangement XML."""
 
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import guitarpro
 
-log = logging.getLogger("slopsmith.lib.gp2rs")
+log = logging.getLogger("feedBack.lib.gp2rs")
 
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 
@@ -56,6 +57,8 @@ class RsNote:
     fret: int
     sustain: float = 0.0
     bend: float = 0.0
+    bend_intent: int = 0
+    bend_values: list | None = None
     slide_to: int = -1
     slide_unpitch_to: int = -1
     hammer_on: bool = False
@@ -69,6 +72,9 @@ class RsNote:
     tremolo: bool = False
     tap: bool = False
     link_next: bool = False
+    # Teaching mark (§6.2.2): fret-hand finger (-1 unset, 0 thumb..4 pinky).
+    # Display only — never used for grading.
+    fret_finger: int = -1
 
 
 @dataclass
@@ -189,6 +195,77 @@ def _duration_to_seconds(duration: guitarpro.Duration, tempo: float) -> float:
     if duration.tuplet.enters > 0 and duration.tuplet.times > 0:
         beats *= duration.tuplet.times / duration.tuplet.enters
     return beats * (60.0 / tempo)
+
+
+# pyguitarpro models bend-point x-positions on 0..BendEffect.maxPosition (12)
+# across the note's duration; y-values are half-quarter-tone units where 12 = 6
+# semitones, so semitones = value / 2.0 (matches the scalar `bend` derivation).
+_GP_BEND_MAX_POSITION = 12
+
+
+def _bend_intent_from_values(values: list[float]) -> int:
+    """Classify a bend gesture (§6.2.1) from its time-ordered semitone values:
+    0 up, 1 release, 2 pre-bend, 3 pre-bend-and-release, 4 round-trip."""
+    if not values:
+        return 0
+    eps = 0.05
+    first, last, peak = values[0], values[-1], max(values)
+    if first > eps:
+        if last <= eps:
+            return 3                      # pre-bent, then released to pitch
+        if last < first - eps:
+            return 1                      # held bend let down
+        return 2                          # pre-bend held
+    if peak > eps and last <= eps:
+        return 4                          # bend up and back down
+    return 0                              # plain bend up
+
+
+def _gp_bend_shape(bend, duration_secs: float):
+    """From a pyguitarpro ``BendEffect``, return ``(peak, intent, curve)``.
+
+    ``peak`` is the bend's peak in semitones (the scalar ``bn``); ``intent`` is
+    the §6.2.1 ``bt`` code; ``curve`` is the time-stamped ``bnv`` list
+    (``[{t: seconds-from-onset, v: semitones}]``) or ``None`` when there's no
+    usable shape (no points, or a zero-length note collapsing every point to
+    ``t=0``)."""
+    pts = sorted(bend.points or [], key=lambda p: p.position)
+    if not pts:
+        return 0.0, 0, None
+    values = [round(p.value / 2.0, 1) for p in pts]
+    peak = round(max(values), 1)
+    intent = _bend_intent_from_values(values)
+    curve = None
+    if duration_secs > 0 and len(pts) >= 2:
+        curve = [
+            {"t": round(duration_secs * (p.position / _GP_BEND_MAX_POSITION), 3),
+             "v": v}
+            for p, v in zip(pts, values)
+        ]
+    return peak, intent, curve
+
+
+def _bend_shape_xml_attrs(n: "RsNote") -> dict:
+    """Optional bend-shape XML attributes for a <note>/<chordNote>, default-
+    omitted: `bendIntent` only when non-zero, `bendValues` (a JSON-encoded
+    [{t,v}] curve) only when present. `_parse_note` (lib/song.py) reads these
+    back so a GP-imported bend curve survives import → wire → highway."""
+    attrs: dict = {}
+    if n.bend_intent:
+        attrs["bendIntent"] = str(int(n.bend_intent))
+    if n.bend_values:
+        attrs["bendValues"] = json.dumps(n.bend_values, separators=(",", ":"))
+    return attrs
+
+
+def _finger_xml_attrs(n: "RsNote") -> dict:
+    """Optional teaching-mark XML attribute for a <note>/<chordNote>: `fretFinger`
+    only when set (!= -1). `_parse_note` (lib/song.py) reads it back so a
+    GP-imported fret-hand finger survives import → wire → highway. Display only;
+    never used for grading (§6.2.2)."""
+    if getattr(n, "fret_finger", -1) != -1:
+        return {"fretFinger": str(int(n.fret_finger))}
+    return {}
 
 
 def _tempo_at_tick(tick: int, tempo_map: list[TempoEvent]) -> float:
@@ -458,6 +535,19 @@ def _build_playback_schedule(
 def _gp_string_to_rs(gp_string: int, num_strings: int) -> int:
     """Convert GP string number (1=high) to RS string index (0=low)."""
     return num_strings - gp_string
+
+
+def _gp_finger_to_rs(fingering) -> int:
+    """Coerce a pyguitarpro ``Fingering`` enum to an RS fret-hand finger int.
+
+    Fingering values are ``unknown=-2, open=-1, thumb=0, index=1, middle=2,
+    annular=3, little=4`` — already the RS finger integers for 0..4. Anything
+    open/unknown/out-of-range collapses to ``-1`` (unset), so we never invent a
+    finger. Teaching mark only (§6.2.2); never used for grading."""
+    val = getattr(fingering, "value", fingering)
+    if not isinstance(val, int) or val < 0 or val > 4:
+        return -1
+    return val
 
 
 def _chord_fingers(chord, frets: list[int], num_strings: int) -> list[int]:
@@ -735,12 +825,13 @@ def convert_track(
                     # Techniques
                     eff = note.effect
                     if eff.bend and eff.bend.points:
-                        # pyguitarpro bend point values are in quarter-tones
-                        # (maxValue 12 = 3 whole tones = 6 semitones), so
-                        # semitones = value / 2. The old /100.0 made every bend
-                        # round to 0 (a whole-tone bend is value 4 -> 0.04).
-                        max_bend = max(p.value for p in eff.bend.points)
-                        rn.bend = round(max_bend / 2.0, 1)
+                        # `bn` is the peak; `bnv`/`bt` describe the shape over
+                        # time (§6.2.1). semitones = value / 2 (maxValue 12 = 6
+                        # semitones); the old /100.0 made every bend round to 0.
+                        peak, intent, curve = _gp_bend_shape(eff.bend, dur)
+                        rn.bend = peak
+                        rn.bend_intent = intent
+                        rn.bend_values = curve
 
                     if eff.hammer:
                         # HO vs PO from pitch direction off the prior note on the
@@ -787,6 +878,11 @@ def convert_track(
                         rn.vibrato = True
                     if eff.tremoloPicking:
                         rn.tremolo = True
+
+                    # Fret-hand fingering -> fg teaching mark (§6.2.2). Same
+                    # Fingering enum + value convention as the chord path.
+                    rn.fret_finger = _gp_finger_to_rs(
+                        getattr(eff, "leftHandFinger", None))
 
                     # Whammy / tremolo bar (beat-level dive/raise). RS has no
                     # whammy attribute, so approximate the pitch movement as an
@@ -1026,9 +1122,19 @@ def _build_xml(
 
     # Tuning. RS2014 schema names 6 string slots; we always emit those
     # for compatibility, and emit additional string6+ attributes (up to
-    # `len(tuning)-1`) for 7+ string arrangements. Slopsmith parses
+    # `len(tuning)-1`) for 7+ string arrangements. FeedBack parses
     # them; the format ignores them.
+    #
+    # `stringCount` records the AUTHORITATIVE string count (== len(tuning)),
+    # because the 6-slot padding above erases the 4-vs-5-vs-6-string
+    # distinction for standard tunings (a 4-string bass, 5-string bass and
+    # 6-string guitar are otherwise byte-identical, all string0..5 = 0).
+    # parse_arrangement trims `tuning` back to this on read so downstream
+    # string-count derivation (song.arrangement_string_count, the editor's
+    # _stringCountFor) sees the real width instead of guessing. RS2014 and
+    # any other consumer simply ignore the unknown attribute.
     tuning_el = ET.SubElement(root, "tuning")
+    tuning_el.set("stringCount", str(len(tuning)))
     for i in range(max(6, len(tuning))):
         tuning_el.set(f"string{i}", str(tuning[i] if i < len(tuning) else 0))
     ET.SubElement(root, "capo").text = "0"
@@ -1098,6 +1204,8 @@ def _build_xml(
             "tap": "1" if n.tap else "0",
             "ignore": "0",
         }
+        attrs.update(_bend_shape_xml_attrs(n))
+        attrs.update(_finger_xml_attrs(n))
         ET.SubElement(notes_el, "note", **attrs)
 
     # Chords
@@ -1108,25 +1216,30 @@ def _build_xml(
                                  chordId=str(ch.template_idx),
                                  highDensity="0", strum="down")
         for cn in ch.notes:
-            ET.SubElement(chord_el, "chordNote",
-                          time=f"{cn.time:.3f}",
-                          string=str(cn.string),
-                          fret=str(cn.fret),
-                          sustain=f"{cn.sustain:.3f}",
-                          bend=f"{cn.bend:.1f}" if cn.bend else "0",
-                          hammerOn="1" if cn.hammer_on else "0",
-                          pullOff="1" if cn.pull_off else "0",
-                          slideTo=str(cn.slide_to),
-                          slideUnpitchTo=str(cn.slide_unpitch_to),
-                          harmonic="1" if cn.harmonic else "0",
-                          harmonicPinch="1" if cn.harmonic_pinch else "0",
-                          palmMute="1" if cn.palm_mute else "0",
-                          mute="1" if cn.mute else "0",
-                          vibrato="1" if cn.vibrato else "0",
-                          tremolo="1" if cn.tremolo else "0",
-                          accent="1" if cn.accent else "0",
-                          linkNext="1" if cn.link_next else "0",
-                          tap="1" if cn.tap else "0", ignore="0")
+            cn_attrs = {
+                "time": f"{cn.time:.3f}",
+                "string": str(cn.string),
+                "fret": str(cn.fret),
+                "sustain": f"{cn.sustain:.3f}",
+                "bend": f"{cn.bend:.1f}" if cn.bend else "0",
+                "hammerOn": "1" if cn.hammer_on else "0",
+                "pullOff": "1" if cn.pull_off else "0",
+                "slideTo": str(cn.slide_to),
+                "slideUnpitchTo": str(cn.slide_unpitch_to),
+                "harmonic": "1" if cn.harmonic else "0",
+                "harmonicPinch": "1" if cn.harmonic_pinch else "0",
+                "palmMute": "1" if cn.palm_mute else "0",
+                "mute": "1" if cn.mute else "0",
+                "vibrato": "1" if cn.vibrato else "0",
+                "tremolo": "1" if cn.tremolo else "0",
+                "accent": "1" if cn.accent else "0",
+                "linkNext": "1" if cn.link_next else "0",
+                "tap": "1" if cn.tap else "0",
+                "ignore": "0",
+            }
+            cn_attrs.update(_bend_shape_xml_attrs(cn))
+            cn_attrs.update(_finger_xml_attrs(cn))
+            ET.SubElement(chord_el, "chordNote", **cn_attrs)
 
     # Anchors
     anchors_el = ET.SubElement(level, "anchors", count=str(len(anchors)))
