@@ -1692,14 +1692,16 @@
     // the Target dropdown — never on a per-frame label re-report, which would
     // flicker the <select>.
     let _aspectPanesDirty = true;
-    // Monotonic counter handing each renderer instance a stable pane id.
-    let _aspectPaneCounter = 0;
     function _aspectNowMs() {
         try { return (performance && performance.now) ? performance.now() : 0; } catch (e) { return 0; }
     }
-    function _aspectPaneLabel(arrangement, uid) {
+    // Human label for a slot key: "Main", or "Panel N" (+ " — Arrangement").
+    function _aspectPaneLabel(paneKey, arrangement) {
+        let base;
+        if (paneKey === 'main') { base = 'Main'; }
+        else { const n = parseInt(paneKey.slice(5), 10); base = 'Panel ' + ((isFinite(n) ? n : 0) + 1); }
         const a = (typeof arrangement === 'string') ? arrangement.trim() : '';
-        return a || ('Pane ' + uid);
+        return a ? (base + ' — ' + a) : base;
     }
 
     // Get-or-create the shared bridge object, seeded from defaults + localStorage.
@@ -1719,10 +1721,11 @@
     function _aspectPersist() {
         try {
             const t = _aspectTune(), out = {};
-            // Persist only the shared base. Per-pane overrides (__panels) are
-            // keyed by ephemeral instance ids, so they're intentionally
-            // session-only — persisting them would leak stale keys forever.
             Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = t[k]; });
+            // Persist per-pane overrides too. Keys are durable split slots
+            // ('main' | 'panel<idx>'), a bounded set, so a pane's framing carries
+            // over when the user leaves a song and opens another in the same slot.
+            if (t.__panels) out.__panels = t.__panels;
             localStorage.setItem(_ASPECT_LS, JSON.stringify(out));
         } catch (e) {}
     }
@@ -1742,9 +1745,9 @@
     // refreshed each call for pruning; the dropdown is only marked dirty when a
     // pane is newly added or its label first resolves — not on every re-report,
     // which would flicker the <select>.
-    function _aspectRegisterPane(paneKey, uid, arrangement) {
+    function _aspectRegisterPane(paneKey, arrangement) {
         const reg = window.__h3dAspectPanes || (window.__h3dAspectPanes = {});
-        const label = _aspectPaneLabel(arrangement, uid);
+        const label = _aspectPaneLabel(paneKey, arrangement);
         let e = reg[paneKey];
         if (!e) { e = reg[paneKey] = { label, seen: 0 }; _aspectPanesDirty = true; }
         else if (e.label !== label) { e.label = label; _aspectPanesDirty = true; }
@@ -3915,12 +3918,14 @@
         // __h3dAspectTune edits) without waiting for a resize. 0 until first
         // applySize().
         let _paneAspect = 0;
-        // Stable per-instance id for the wide-pane tuner's Target picker. Each
-        // renderer instance is exactly one pane, so keying overrides + the
-        // readout by this (rather than the split plugin's panel index, which can
-        // ping-pong with focus) keeps the picker steady and unambiguous. Assigned
-        // once in init(); survives destroy()/init() reuse of the same instance.
-        let _paneUid = 0;
+        // Latched split-slot key for the wide-pane tuner ('main' | 'panel<idx>').
+        // Keyed by the durable split slot (via _bgPanelKey) so a pane's overrides
+        // persist across songs — the same slot means the same pane to the user.
+        // Latched to the last real slot so a transient null from panelIndexFor
+        // during a song/layout transition doesn't momentarily flip it to 'main'
+        // and drop the override for a frame. Reset in destroy() for instance
+        // reuse in a different slot.
+        let _paneKeyCached = '';
         // True once applySize() has pinned the .h3d-wrap overlay to the
         // highway canvas's offset box. Stays false while the canvas has no
         // layout yet (init() can run before #highway has a real box, where
@@ -14382,8 +14387,10 @@
             // effectiveVfov returns the base vertical fov and cam.fov is restored
             // to it. The fov write is guarded on an actual change so a steady pane
             // costs nothing.
-            const _paneKey = 'pane' + _paneUid;
-            _aspectRegisterPane(_paneKey, _paneUid, bundle && bundle.songInfo && bundle.songInfo.arrangement);
+            const _pk0 = _bgPanelKey(highwayCanvas);
+            if (_pk0 !== 'main') _paneKeyCached = _pk0;   // latch the real slot; ignore transient nulls
+            const _paneKey = _paneKeyCached || _pk0;
+            _aspectRegisterPane(_paneKey, bundle && bundle.songInfo && bundle.songInfo.arrangement);
             const _aspTune = _resolveTuneFor(_paneKey);
             const _aspActive = !!(_aspTune && _aspTune.enabled
                 && !(_aspTune.splitOnly && !_ssActive()));
@@ -14835,7 +14842,6 @@
                 }
                 _destroyed = _isReady = false;
                 _isFocused = true;
-                if (!_paneUid) _paneUid = ++_aspectPaneCounter;   // stable pane id for the tuner picker
                 _registerAspectAbShortcut();   // session-global tuner shortcut (self-guarded)
                 const myToken = ++_initToken;
                 highwayCanvas = canvas;
@@ -15256,6 +15262,7 @@
                 _lastHwW = 0; _lastHwH = 0;
                 _appliedW = 0; _appliedH = 0;
                 _paneAspect = 0;
+                _paneKeyCached = '';
                 if (cam && cam.fov !== BASE_VFOV) { cam.fov = BASE_VFOV; cam.updateProjectionMatrix(); }
                 _wrapPinned = false;
                 _unsubscribeFocus(); teardown();

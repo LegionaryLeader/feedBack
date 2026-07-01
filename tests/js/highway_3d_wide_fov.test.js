@@ -174,13 +174,22 @@ test('a Target select and pane registry drive the per-pane picker', () => {
         'camUpdate must register its pane each frame');
 });
 
-test('panes are keyed by a stable per-instance id, not the split panel index', () => {
-    // Keying by a stable instance uid keeps the Target picker steady; the split
-    // plugin's panel index can ping-pong with focus and cause flicker/dupes.
-    assert.match(src, /_paneUid\s*=\s*\+\+\s*_aspectPaneCounter/,
-        'each renderer instance must take a stable pane uid in init()');
-    assert.match(src, /const\s+_paneKey\s*=\s*'pane'\s*\+\s*_paneUid\s*;/,
-        'camUpdate must key the pane by its stable instance uid');
+test('panes are keyed by the durable split slot and the key is latched', () => {
+    // Slot keys ('main' | 'panel<idx>') persist across songs, so a pane's
+    // overrides carry over. The key is latched to the last real slot so a
+    // transient null from panelIndexFor doesn't flip it to 'main' for a frame.
+    assert.match(src, /const\s+_pk0\s*=\s*_bgPanelKey\(\s*highwayCanvas\s*\)\s*;/,
+        'camUpdate must derive the slot key from _bgPanelKey(highwayCanvas)');
+    assert.match(src, /if\s*\(\s*_pk0\s*!==\s*'main'\s*\)\s*_paneKeyCached\s*=\s*_pk0\s*;[\s\S]*?const\s+_paneKey\s*=\s*_paneKeyCached\s*\|\|\s*_pk0\s*;/,
+        'camUpdate must latch the last real slot key');
+});
+
+test('per-pane overrides persist to localStorage (carry across songs)', () => {
+    assert.match(
+        src,
+        /function\s+_aspectPersist\s*\(\)[\s\S]*?if\s*\(\s*t\.__panels\s*\)\s*out\.__panels\s*=\s*t\.__panels/,
+        '_aspectPersist must include __panels so per-slot overrides survive a reload / song change',
+    );
 });
 
 test('the target dropdown prunes dead panes and does not rebuild while focused', () => {
