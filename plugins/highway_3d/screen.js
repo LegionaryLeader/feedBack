@@ -1614,11 +1614,11 @@
     // itself out); it's a harmless debug control, so it is never unregistered.
     // No-ops where the core shortcut API isn't present (older core / borrowed
     // contexts).
-    let _abShortcutRegistered = false;
-    function _registerAspectAbShortcut() {
-        if (_abShortcutRegistered) return;
+    let _tunerShortcutRegistered = false;
+    function _registerTunerShortcut() {
+        if (_tunerShortcutRegistered) return;
         if (typeof window.registerShortcut !== 'function') return;
-        _abShortcutRegistered = true;
+        _tunerShortcutRegistered = true;
         try {
             window.registerShortcut({
                 key: 'A',   // uppercase e.key → produced with Shift held (Shift+A)
@@ -1632,7 +1632,7 @@
                 },
             });
         } catch (e) {
-            _abShortcutRegistered = false;   // allow a later retry if it threw
+            _tunerShortcutRegistered = false;   // allow a later retry if it threw
         }
     }
 
@@ -1685,8 +1685,8 @@
     let _aspectHfovCb = null;         // hfov-override checkbox (synced explicitly)
     let _aspectHfovSl = null;         // hfov-override slider
     // Which pane the panel edits. '' = all panes (writes the shared base object);
-    // a pane key (e.g. 'pane1') writes that pane's sparse override, so one split
-    // pane can be framed independently of the others.
+    // a pane key ('arr:<name>' or the fallback 'pane:<uid>') writes that pane's
+    // sparse override, so one split pane can be framed independently.
     let _aspectEditTarget = '';
     // Bumped when the SET of live panes changes (add/prune) so the panel rebuilds
     // the Target dropdown — never on a per-frame label re-report, which would
@@ -1696,7 +1696,8 @@
     // arrangement name to key by).
     let _aspectPaneCounter = 0;
     function _aspectNowMs() {
-        try { return (performance && performance.now) ? performance.now() : 0; } catch (e) { return 0; }
+        try { if (performance && performance.now) return performance.now(); } catch (e) {}
+        try { return Date.now(); } catch (e) { return 0; }   // keep pruning functional
     }
     // Pane key: prefer the arrangement name ('arr:Bass') so a pane's framing is
     // stable across songs AND distinct between split panes, with no dependency on
@@ -1727,7 +1728,11 @@
         }
         return t;
     }
+    // Bumped on every tune mutation (all writes funnel through _aspectPersist) so
+    // the per-pane resolve cache below can invalidate cheaply.
+    let _aspectRev = 0;
     function _aspectPersist() {
+        _aspectRev++;
         try {
             const t = _aspectTune(), out = {};
             Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = t[k]; });
@@ -1747,13 +1752,20 @@
     }
 
     // Resolve the effective tune for a pane: the shared base, with that pane's
-    // override keys (if any) laid on top. Called every frame per renderer.
+    // override keys (if any) laid on top. Called every frame per renderer, so the
+    // merged object is memoized per pane and only rebuilt when the tune mutates
+    // (_aspectRev changes). Panes with no override return the base directly (no
+    // allocation).
+    const _aspectResolveCache = new Map();   // paneKey -> { rev, obj }
     function _resolveTuneFor(paneKey) {
         const base = _aspectTune();
         const ov = base.__panels && base.__panels[paneKey];
         if (!ov) return base;
+        const c = _aspectResolveCache.get(paneKey);
+        if (c && c.rev === _aspectRev) return c.obj;
         const out = {};
         Object.keys(_ASPECT_DEFAULTS).forEach((k) => { out[k] = (k in ov) ? ov[k] : base[k]; });
+        _aspectResolveCache.set(paneKey, { rev: _aspectRev, obj: out });
         return out;
     }
     // Record a live pane so the Target dropdown can list it. Called every frame
@@ -2037,7 +2049,9 @@
         if (!_aspectPanelEl) return;
         _aspectPanelEl.style.display = on ? 'block' : 'none';
         window.__h3dAspectPanelOpen = !!on;        // gates the per-frame readout publish
-        if (on) { _aspectBuildTargets(); }
+        // Prune before the first build so panes from a prior song/split don't
+        // flash in the dropdown until the first RAF tick.
+        if (on) { _aspectPrunePanes(); _aspectBuildTargets(); }
         if (on && !_aspectPanelRAF) {
             const tick = () => {
                 if (!window.__h3dAspectPanelOpen) { _aspectPanelRAF = 0; return; }
@@ -14898,7 +14912,7 @@
                 _destroyed = _isReady = false;
                 _isFocused = true;
                 if (!_paneUid) _paneUid = ++_aspectPaneCounter;   // fallback pane id (no-arrangement panes)
-                _registerAspectAbShortcut();   // session-global tuner shortcut (self-guarded)
+                _registerTunerShortcut();   // session-global tuner shortcut (self-guarded)
                 const myToken = ++_initToken;
                 highwayCanvas = canvas;
                 _invertedCached = !!(bundle && bundle.inverted);

@@ -243,6 +243,31 @@ test('single-pane forces the edit target back to All (no hidden pane edits)', ()
     );
 });
 
+test('resolved per-pane tune is memoized and invalidated by a revision', () => {
+    assert.match(src, /_aspectRev\s*\+\+/, 'a mutation revision must be bumped on persist');
+    assert.match(
+        src,
+        /_aspectResolveCache\.get\(\s*paneKey\s*\)[\s\S]*?c\.rev\s*===\s*_aspectRev[\s\S]*?return\s+c\.obj/,
+        '_resolveTuneFor must return a cached object when the revision is unchanged',
+    );
+});
+
+test('the pane clock falls back to Date.now so pruning keeps working', () => {
+    assert.match(
+        src,
+        /function\s+_aspectNowMs\s*\(\)[\s\S]*?performance\.now\(\)[\s\S]*?return\s+Date\.now\(\)/,
+        '_aspectNowMs must fall back to Date.now() when the Performance API is absent',
+    );
+});
+
+test('opening the panel prunes before the first dropdown build', () => {
+    assert.match(
+        src,
+        /if\s*\(\s*on\s*\)\s*\{\s*_aspectPrunePanes\(\)\s*;\s*_aspectBuildTargets\(\)/,
+        '_setAspectPanelVisible must prune stale panes before building the dropdown',
+    );
+});
+
 test('the panel has a dismiss (close) control', () => {
     assert.match(
         src,
