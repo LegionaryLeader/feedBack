@@ -455,8 +455,12 @@ def _apply_pending_db_restore(config_dir: Path) -> None:
 # TOTAL — which also fixes a latent OFFSET skip/dupe across equal-key rows.
 # (column, collate-clause, primary-direction) — tiebreak is always `filename` ASC.
 _KEYSET_SORTS = {
-    "artist": ("artist", "COLLATE NOCASE", "ASC"),
-    "artist-desc": ("artist", "COLLATE NOCASE", "DESC"),
+    # artist/artist-desc left OUT deliberately: their ORDER BY carries a
+    # title secondary (so cards within an artist read alphabetically, like
+    # the tree view) which a two-term (value, filename) cursor can't seek
+    # correctly — they page by OFFSET, which is measured-trivial at real
+    # library sizes. Restore them with a composite sort-key column if
+    # 50k-song libraries ever make OFFSET hurt.
     "title": ("title", "COLLATE NOCASE", "ASC"),
     "title-desc": ("title", "COLLATE NOCASE", "DESC"),
     "recent": ("mtime", "", "DESC"),
@@ -3517,7 +3521,13 @@ class MetadataDB:
             where += self._GROUP_REP_PREDICATE
 
         sort_map = {
-            "artist": "artist COLLATE NOCASE", "artist-desc": "artist COLLATE NOCASE DESC",
+            # Artist sorts order WITHIN an artist by title (the tree view's
+            # artist -> album -> title feel) instead of raw filename — the
+            # "list is organised, cards look random" report. Direction is
+            # baked per entry (the legacy `dir=desc` append would otherwise
+            # land on the title term); title stays ascending under Z->A.
+            "artist": "artist COLLATE NOCASE ASC, title COLLATE NOCASE ASC",
+            "artist-desc": "artist COLLATE NOCASE DESC, title COLLATE NOCASE ASC",
             "title": "title COLLATE NOCASE", "title-desc": "title COLLATE NOCASE DESC",
             "recent": "mtime DESC",
             # Tuning sort uses musical distance from E Standard
@@ -3589,14 +3599,23 @@ class MetadataDB:
                    "FROM work_display w1 WHERE w1.filename = songs.filename))")
             sort_map["mastery"] = f"({_gm} IS NULL) ASC, {_gm} ASC"
             sort_map["mastery-desc"] = f"({_gm} IS NULL) ASC, {_gm} DESC"
-        order = sort_map.get(sort, "artist COLLATE NOCASE")
+        # Fold the legacy `dir=desc` toggle into the canonical sort key BEFORE
+        # the lookup, so the ORDER BY is built from the effective sort — mirrors
+        # what `_effective_keyset_sort` does on the cursor side. Needed because
+        # the artist clause now bakes in `ASC` (for the title secondary), so the
+        # ` DESC` append below is suppressed and would otherwise silently ignore
+        # `sort=artist&dir=desc` (return A→Z). Only artist/title fold (they have
+        # `-desc` twins); tuning/year/mastery keep their own dir handling.
+        eff = _effective_keyset_sort(sort, direction)
+        order = sort_map.get(eff, "artist COLLATE NOCASE")
         # Legacy `dir=desc` toggle: only safe to append on simple sort
         # clauses that don't already encode a direction. Compound /
-        # multi-term entries above (tuning, year, year-desc) bake their
+        # multi-term entries above (artist, tuning, year, year-desc) bake their
         # ASC/DESC into the clause, so a global ` DESC` append would
         # produce invalid SQL like `CAST(year AS INTEGER) ASC DESC`.
         # Skip the append in that case — clients flipping direction on
-        # those sorts use the explicit `-desc` sort key instead.
+        # those sorts use the explicit `-desc` sort key instead. (For
+        # artist/title the fold above already picked the `-desc` clause.)
         if direction == "desc" and " ASC" not in order and " DESC" not in order:
             order += " DESC"
         # Unique, deterministic tiebreak → a TOTAL order. Without it, rows with
