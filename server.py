@@ -199,6 +199,7 @@ _DEMO_BLOCKED: list[tuple[str, re.Pattern]] = [
     ("DELETE", re.compile(r"^/api/audio-effects/active-mapping$")),
     ("POST",   re.compile(r"^/api/song/.*/meta$")),
     ("POST",   re.compile(r"^/api/song/.*/art/upload$")),
+    ("PUT",    re.compile(r"^/api/song/.+/overrides$")),
     ("GET",    re.compile(r"^/api/plugins/updates$")),
     ("POST",   re.compile(r"^/api/plugins/[^/]+/update$")),
     ("POST",   re.compile(r"^/api/plugins/editor/save$")),
@@ -555,7 +556,13 @@ def next_library_cursor(sort: str, last_song: dict | None) -> str | None:
     key = "mtime" if col == "mtime" else col
     if key not in last_song or "filename" not in last_song:
         return None
-    return _encode_cursor([last_song[key], last_song["filename"]])
+    # A title display-override (Fix-metadata popup) replaces last_song["title"]
+    # for the card, but the keyset seek runs on the RAW title column — resume
+    # from the raw value query_page stashed (present only when the last row's
+    # title was overridden), so paging never skips/dupes.
+    val = (last_song["_sort_title"] if (key == "title" and "_sort_title" in last_song)
+           else last_song[key])
+    return _encode_cursor([val, last_song["filename"]])
 
 
 # Song-level "mastered" threshold — best accuracy across a song's arrangements
@@ -667,6 +674,26 @@ class MetadataDB:
             )
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_song_tags_tag ON song_tags(tag COLLATE NOCASE)")
+        # Per-field metadata OVERRIDES + LOCKS (the Fix-metadata popup). A
+        # reversible DISPLAY overlay, never written to the pack: `value` is the
+        # user's corrected value for a catalog field (title/artist/album/year/
+        # genre), `locked=1` pins the field so a metadata refresh / auto-match
+        # never changes what's shown for it (Plex-style field lock). Effective
+        # display value = override → matched-MusicBrainz → pack → derived.
+        # Filename-keyed → purged with the song on delete_song, NEVER on a
+        # rescan (delete_missing), so an edit survives re-import like every other
+        # local layer.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS song_field_override (
+                filename TEXT NOT NULL,
+                field TEXT NOT NULL,        -- title|artist|album|year|genre
+                value TEXT,                 -- corrected value (NULL = lock only, no override)
+                locked INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (filename, field)
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_field_override_fn ON song_field_override(filename)")
         # Artist-name aliases (P4): "ACDC" → "AC/DC", "the beatles" → "The Beatles".
         # A CANONICALIZATION OVERRIDE applied AT DISPLAY only — the scanner-derived
         # `songs.artist` and the feedpak files are never rewritten (a rescan can't
@@ -1168,6 +1195,88 @@ class MetadataDB:
             self.conn.commit()
         return self.get_song_user_meta(filename)
 
+    # ── Per-field metadata overrides + locks (Fix-metadata popup) ─────────────
+    def get_song_overrides(self, filename: str) -> dict:
+        """{field: {"value": str|None, "locked": bool}} for one song."""
+        rows = self.conn.execute(
+            "SELECT field, value, locked FROM song_field_override WHERE filename = ?",
+            (filename,)).fetchall()
+        return {r[0]: {"value": r[1], "locked": bool(r[2])} for r in rows}
+
+    def set_song_override(self, filename: str, field: str, *,
+                          value="__keep__", locked="__keep__") -> dict:
+        """Partial upsert of one field's override value and/or lock. Pass a
+        value/locked to set it or leave the sentinel to keep the current one. A
+        row with neither a value nor a lock is dropped (no empty shell). Returns
+        the song's full override map."""
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT value, locked FROM song_field_override WHERE filename = ? AND field = ?",
+                (filename, field)).fetchone()
+            new_val = (cur[0] if cur else None) if value == "__keep__" else value
+            new_lock = (bool(cur[1]) if cur else False) if locked == "__keep__" else bool(locked)
+            new_val = (new_val or "").strip() or None
+            if new_val is None and not new_lock:
+                self.conn.execute(
+                    "DELETE FROM song_field_override WHERE filename = ? AND field = ?",
+                    (filename, field))
+            else:
+                self.conn.execute(
+                    "INSERT INTO song_field_override (filename, field, value, locked, updated_at) "
+                    "VALUES (?, ?, ?, ?, datetime('now')) "
+                    "ON CONFLICT(filename, field) DO UPDATE SET "
+                    "value = excluded.value, locked = excluded.locked, updated_at = excluded.updated_at",
+                    (filename, field, new_val, 1 if new_lock else 0))
+            self.conn.commit()
+        return self.get_song_overrides(filename)
+
+    def locked_fields(self, filename: str) -> set:
+        """The catalog fields the user LOCKED for a song (Fix-metadata popup).
+        An automatic match must never (re)canonicalize these, and gap-fill must
+        never write them to the file. Locked read (the enrichment worker calls
+        it), minimal projection."""
+        with self._lock:
+            return {r[0] for r in self.conn.execute(
+                "SELECT field FROM song_field_override WHERE filename = ? AND locked = 1",
+                (filename,)).fetchall()}
+
+    def clear_song_override(self, filename: str, field: str) -> dict:
+        """Remove a field's override + lock entirely (revert to the resolved
+        pack/matched value)."""
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM song_field_override WHERE filename = ? AND field = ?",
+                (filename, field))
+            self.conn.commit()
+        return self.get_song_overrides(filename)
+
+    def overrides_map(self, filenames) -> dict:
+        """{filename: {field: {value, locked}}} for a batch — feeds the grid's
+        effective-value resolution (display slice). Chunked under SQLite's
+        variable limit."""
+        fns = list(filenames)
+        out: dict = {}
+        for i in range(0, len(fns), 400):
+            chunk = fns[i:i + 400]
+            if not chunk:
+                break
+            q = ("SELECT filename, field, value, locked FROM song_field_override "
+                 "WHERE filename IN (%s)" % ",".join("?" * len(chunk)))
+            for fn, field, value, locked in self.conn.execute(q, chunk).fetchall():
+                out.setdefault(fn, {})[field] = {"value": value, "locked": bool(locked)}
+        return out
+
+    def pack_fields(self, filename: str) -> dict:
+        """The stored (pack) values for the overridable catalog fields — the
+        Fix-metadata popup shows these behind each override as the 'revert to
+        pack' reference + the Yours/Pack provenance. Empty strings for a missing
+        song so the popup always has a value to render."""
+        keys = ("title", "artist", "album", "year", "genre")
+        row = self.conn.execute(
+            "SELECT title, artist, album, year, genre FROM songs WHERE filename = ?",
+            (filename,)).fetchone()
+        return {k: ((row[i] or "") if row else "") for i, k in enumerate(keys)}
+
     def set_song_tags(self, filename: str, tags) -> list:
         """Replace ALL of a song's tags with the given set (each normalized;
         blanks + case-dupes dropped). Full-replace so the whole personal-meta
@@ -1232,6 +1341,7 @@ class MetadataDB:
         INSIDE the caller's `meta_db._lock` — must not re-acquire the lock."""
         self.conn.execute("DELETE FROM song_user_meta WHERE filename = ?", (filename,))
         self.conn.execute("DELETE FROM song_tags WHERE filename = ?", (filename,))
+        self.conn.execute("DELETE FROM song_field_override WHERE filename = ?", (filename,))
 
     def batch_user_meta(self, filenames, *, set_difficulty="__keep__",
                         add_tags=None, remove_tags=None) -> int:
@@ -4063,6 +4173,15 @@ class MetadataDB:
         # per-tile state only paints while a pass runs. Cheap set membership like
         # favs/estd, so the misses stay visible at rest.
         um = self._unmatched_set(fns)
+        # Per-song display OVERRIDES (Fix-metadata popup, slice 3). "Grid shows
+        # only overrides": the effective cell is the user's override else the
+        # pack value — a matched MusicBrainz canon NEVER silently re-titles a
+        # card (canon lives in the Details drawer + art). Overlaid in Python
+        # over the visible window, keyset-safe exactly like the P4 alias re-label
+        # below: the seek still runs on the raw column (the one overridable
+        # keyset column, title, stashes its raw value for the cursor — see
+        # _sort_title / next_library_cursor).
+        omap = self.overrides_map(fns)
         # Canonical artist at display (P4): re-label the card's artist through the
         # alias override so "ACDC" reads as "AC/DC". Display-only — the row's sort
         # position (raw artist) is untouched, so a card can show a canonical name
@@ -4075,6 +4194,18 @@ class MetadataDB:
             s["unmatched"] = s["filename"] in um
             if amap:
                 s["artist"] = amap.get((s.get("artist") or "").lower(), s.get("artist"))
+            # Override wins over the pack AND the alias re-label — it's the user's
+            # explicit per-song choice. Only a non-empty override VALUE replaces a
+            # cell; a lock-only row (value None) leaves the displayed value alone.
+            ov = omap.get(s["filename"])
+            if ov:
+                for field in ("title", "artist", "album", "year"):
+                    cell = ov.get(field)
+                    val = cell.get("value") if cell else None
+                    if val:
+                        if field == "title":
+                            s["_sort_title"] = s["title"]   # raw title, for the keyset cursor
+                        s[field] = val
         # Grouped rows carry the ⚑ N (chart_count) + the work_key from the
         # materialized read-model, so the card can render the "N charts" chip and
         # address the Charts drawer (GET /api/work/{work_key}/charts) without a
@@ -6986,6 +7117,34 @@ def _artist_title_from_filename(filename: str) -> dict | None:
     return {"artist": artist, "title": title}
 
 
+# A per-song LOCK (Fix-metadata popup) → the candidate display keys it
+# suppresses on an AUTOMATIC match. Identity keys (recording/release/artist ids,
+# isrc) are deliberately absent: a locked DISPLAY field still gets matched for
+# art + future re-match, it just isn't re-canonicalized behind the user's back.
+_LOCK_FIELD_TO_CAND = {
+    "artist": ("artist", "artist_sort"),
+    "title": ("title",),
+    "album": ("album",),
+    "year": ("year",),
+    "genre": ("genres",),
+}
+
+
+def _compose_lock_filter(base_filter, locked_fields):
+    """Wrap the pass's global per-field apply-filter with a per-song filter that
+    also strips the song's LOCKED display fields, so an automatic match never
+    re-canonicalizes a field the user pinned. Returns base_filter unchanged when
+    the song has no relevant lock (the common path)."""
+    blocked = {ck for f in locked_fields for ck in _LOCK_FIELD_TO_CAND.get(f, ())}
+    if not blocked:
+        return base_filter
+
+    def lock_filter(cand):
+        c = base_filter(cand) if base_filter else cand
+        return {k: v for k, v in c.items() if k not in blocked}
+    return lock_filter
+
+
 def _enrich_one(row: dict, auto_min: float | None = None, field_filter=None,
                 apply_mask: str = "") -> None:
     """The matcher (P8; replaces P7's no-op). Precedence per design §5:
@@ -7011,6 +7170,14 @@ def _enrich_one(row: dict, auto_min: float | None = None, field_filter=None,
     siblings. Network errors raise EnrichTransportError so the pass pauses
     instead of burning attempts while offline."""
     fn, chash = row["filename"], row["content_hash"]
+    # Respect per-song field LOCKS (Fix-metadata popup): an automatic match must
+    # not re-canonicalize a field the user pinned. Compose the lock filter onto
+    # the pass's global apply-filter — both the cache-copy and text-match auto
+    # paths run their candidate through it. (Review/manual picks bypass the
+    # filter, so confirming a match in the modal is an explicit override.)
+    locked = meta_db.locked_fields(fn)
+    if locked:
+        field_filter = _compose_lock_filter(field_filter, locked)
 
     cached = meta_db.enrichment_cache_lookup(chash, exclude_filename=fn)
     if cached:
@@ -8696,6 +8863,10 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
     # The cursor to resume after this page (effective sort folds in dir=desc).
     next_cursor = (next_library_cursor(_effective_keyset_sort(sort, dir), songs[-1])
                    if (is_local and songs) else None)
+    # Drop the private raw-title stash query_page attached for the cursor — it's
+    # an internal keyset detail, not part of the card payload.
+    for s in songs:
+        s.pop("_sort_title", None)
     return {"songs": songs, "total": total, "page": page, "size": size,
             "next_cursor": next_cursor}
 
@@ -9032,6 +9203,60 @@ def put_song_user_meta(filename: str, data: dict):
     if tags != "__absent__":
         meta_db.set_song_tags(key, tags)
     return meta_db.get_song_user_meta(key)
+
+
+# Catalog fields the Fix-metadata popup may override/lock — the intersection of
+# "displayable identity" and "safe to correct locally". Guitar/practice facts
+# and personal fields are never overrides.
+_OVERRIDE_FIELDS = frozenset({"title", "artist", "album", "year", "genre"})
+
+
+@app.get("/api/song/{filename:path}/overrides")
+def get_song_overrides(filename: str):
+    """Per-field metadata overrides + locks for one song (Fix-metadata popup):
+    {"overrides": {field: {"value": str|null, "locked": bool}},
+     "pack": {field: str}}. `pack` is the stored value each override sits on top
+    of — the popup's Details tab renders it as the revert-to-pack reference and
+    the Yours/Pack provenance."""
+    key = meta_db._canonical_song_filename(filename)
+    return {"overrides": meta_db.get_song_overrides(key),
+            "pack": meta_db.pack_fields(key)}
+
+
+@app.put("/api/song/{filename:path}/overrides")
+def put_song_overrides(filename: str, data: dict):
+    """Set/clear per-field overrides + locks. Body:
+    `{"overrides": {field: {"value": str|null, "locked": bool}}}`. Only catalog
+    fields (title/artist/album/year/genre) are accepted. A field left with no
+    value and unlocked is removed. Returns the merged override map.
+
+    Clearing rides this PUT (send value:null, locked:false) rather than a DELETE
+    sub-route, because `DELETE /api/song/{filename:path}` already owns every
+    DELETE under /api/song and would shadow it (same reason as tags)."""
+    ov = (data or {}).get("overrides")
+    if not isinstance(ov, dict) or not ov:
+        return JSONResponse({"error": "overrides must be a non-empty object"}, 400)
+    bad = sorted(f for f in ov if f not in _OVERRIDE_FIELDS)
+    if bad:
+        return JSONResponse({"error": "unknown field(s): " + ", ".join(bad)}, 400)
+    key = meta_db._canonical_song_filename(filename)
+    for field, spec in ov.items():
+        if not isinstance(spec, dict):
+            return JSONResponse({"error": f"'{field}' must be an object with value/locked"}, 400)
+        kwargs: dict = {}
+        if "value" in spec:
+            v = spec["value"]
+            if v is None:
+                kwargs["value"] = None
+            elif isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                kwargs["value"] = str(v).strip()[:500]
+            else:
+                return JSONResponse({"error": f"'{field}' value must be a string or null"}, 400)
+        if "locked" in spec:
+            kwargs["locked"] = bool(spec["locked"])
+        if kwargs:
+            meta_db.set_song_override(key, field, **kwargs)
+    return {"overrides": meta_db.get_song_overrides(key)}
 
 
 @app.post("/api/songs/user-meta/batch")
@@ -12202,15 +12427,21 @@ def _gap_fill_proposals(cache_key: str, resolved) -> tuple[dict, str]:
         manifest = sloppak_mod.load_manifest(resolved) or {}
     except Exception:
         return {}, "not-sloppak"
+    # A LOCKED field (Fix-metadata popup) is never gap-filled — the user pinned
+    # it away from the matched value, so writing that value to the file would
+    # be exactly the clobber the lock exists to prevent. (The lock field name is
+    # `genre`; the manifest/gap-fill key is `genres`.)
+    locked = meta_db.locked_fields(cache_key)
     out = {}
     album = (row.get("canon_album") or "").strip()
-    if album and _gap_fill_manifest_absent(manifest, "album"):
+    if album and "album" not in locked and _gap_fill_manifest_absent(manifest, "album"):
         out["album"] = album
     year = (row.get("canon_year") or "").strip()
-    if year.isdigit() and int(year) and _gap_fill_manifest_absent(manifest, "year"):
+    if (year.isdigit() and int(year) and "year" not in locked
+            and _gap_fill_manifest_absent(manifest, "year")):
         out["year"] = int(year)
     genres = [str(g) for g in (row.get("genres") or []) if isinstance(g, str) and g.strip()]
-    if genres and _gap_fill_manifest_absent(manifest, "genres"):
+    if genres and "genre" not in locked and _gap_fill_manifest_absent(manifest, "genres"):
         out["genres"] = genres
     # Identity keys (feedpak spec 1.14.0) — written in canonical form only.
     mbid = (row.get("mb_recording_id") or "").strip().lower()
