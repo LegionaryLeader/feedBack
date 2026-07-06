@@ -12,6 +12,22 @@
     <div class="mt-3">
         <h4 class="text-xs font-medium text-gray-300 mb-2">Graphics</h4>
 
+        <label for="keysh3d-fx-palette" class="text-xs font-medium text-gray-400 mb-1 block">Note colours</label>
+        <select id="keysh3d-fx-palette"
+            onchange="window.keys3dSetPalette && window.keys3dSetPalette(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="octaves" selected>Octaves (colour per octave, darker sharps)</option>
+            <option value="emerald">Emerald (green, darker sharps)</option>
+            <option value="ice">Ice (blue, darker sharps)</option>
+            <option value="classic">Rainbow (per-pitch)</option>
+            <option value="vivid">Vivid (per-pitch, punchier)</option>
+            <option value="pastel">Pastel (per-pitch, soft)</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1 mb-3">
+            Choose the colour scheme for the falling notes, key glow, lane
+            guides and hit flames. Each option is described in its own label.
+        </p>
+
         <label for="keysh3d-fx-theme" class="text-xs font-medium text-gray-400 mb-1 block">Scene theme</label>
         <select id="keysh3d-fx-theme"
             onchange="window.keys3dSetTheme && window.keys3dSetTheme(this.value)"
@@ -30,7 +46,59 @@
         </select>
         <p class="text-xs text-gray-500 mt-1 mb-3">
             Background gradient, floor and lane rails — the same theme names
-            as the guitar highway. Pitch-class note colours never change.
+            as the guitar highway. Note colours come from the
+            "Note colours" palette above.
+        </p>
+
+        <label for="keysh3d-fx-camera" class="text-xs font-medium text-gray-400 mb-1 block">Camera angle</label>
+        <select id="keysh3d-fx-camera"
+            onchange="window.keys3dSetCamera && window.keys3dSetCamera(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="classic">Classic (low, deep runway)</option>
+            <option value="elevated">Elevated (higher, more board)</option>
+            <option value="overhead" selected>Overhead (top-down reading view)</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1 mb-3">
+            Where the camera sits. Classic is the original low rig; Elevated
+            lifts it for a fuller view of the keybed; Overhead looks down the
+            lanes for a sheet-reading feel. Applies live, keeps the
+            auto-pan/zoom that follows your hands.
+        </p>
+
+        <label for="keysh3d-fx-camheight" class="text-xs font-medium text-gray-400 mb-1 block">
+            Camera height <span id="keysh3d-fx-camheight-val" class="text-gray-500 font-mono">1.00</span>
+        </label>
+        <input type="range" id="keysh3d-fx-camheight"
+            min="0.4" max="2.2" step="0.02" value="1"
+            oninput="window.keys3dSetFx && window.keys3dSetFx('camHeight', this.value); document.getElementById('keysh3d-fx-camheight-val').textContent = parseFloat(this.value).toFixed(2)"
+            class="w-full">
+        <p class="text-xs text-gray-500 mt-1">
+            Raise or lower the camera around the angle above (higher = more
+            top-down). Fine-tunes the base view; the follow-motion stays.
+        </p>
+
+        <label for="keysh3d-fx-camdist" class="text-xs font-medium text-gray-400 mb-1 mt-3 block">
+            Camera distance <span id="keysh3d-fx-camdist-val" class="text-gray-500 font-mono">1.00</span>
+        </label>
+        <input type="range" id="keysh3d-fx-camdist"
+            min="0.4" max="2.2" step="0.02" value="1"
+            oninput="window.keys3dSetFx && window.keys3dSetFx('camDist', this.value); document.getElementById('keysh3d-fx-camdist-val').textContent = parseFloat(this.value).toFixed(2)"
+            class="w-full">
+        <p class="text-xs text-gray-500 mt-1">
+            Pull the camera back or push it in (larger = further away, smaller
+            = closer).
+        </p>
+
+        <label for="keysh3d-fx-camtilt" class="text-xs font-medium text-gray-400 mb-1 mt-3 block">
+            Camera tilt <span id="keysh3d-fx-camtilt-val" class="text-gray-500 font-mono">-0.60</span>
+        </label>
+        <input type="range" id="keysh3d-fx-camtilt"
+            min="-1" max="1" step="0.02" value="-0.6"
+            oninput="window.keys3dSetFx && window.keys3dSetFx('camTilt', this.value); document.getElementById('keysh3d-fx-camtilt-val').textContent = parseFloat(this.value).toFixed(2)"
+            class="w-full">
+        <p class="text-xs text-gray-500 mt-1 mb-3">
+            Tilt the view up (+) or down (−) without moving the camera —
+            aims higher up the runway or down toward the keys. 0 = neutral.
         </p>
 
         <label for="keysh3d-fx-cinematic" class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
@@ -190,6 +258,24 @@
             hydrateFxRange('vibrancy', 'keysh3d-fx-vibrancy', 'keysh3d-fx-vibrancy-val');
             hydrateFxRange('glow', 'keysh3d-fx-glow', 'keysh3d-fx-glow-val');
             hydrateFxRange('bgIntensity', 'keysh3d-fx-bgintensity', 'keysh3d-fx-bgintensity-val');
+            // Camera fine-tune sliders live outside 0-1 — clamp to the
+            // control's own min/max (mirrors screen.js FX_RANGES).
+            const hydrateFxRangeIn = (key, elId, valId) => {
+                const n = parseFloat(localStorage.getItem('keys3d_bg_' + key));
+                if (!Number.isFinite(n)) return;
+                const el = document.getElementById(elId);
+                const v = Math.min(parseFloat(el.max), Math.max(parseFloat(el.min), n));
+                el.value = String(v);
+                document.getElementById(valId).textContent = v.toFixed(2);
+            };
+            hydrateFxRangeIn('camHeight', 'keysh3d-fx-camheight', 'keysh3d-fx-camheight-val');
+            hydrateFxRangeIn('camDist', 'keysh3d-fx-camdist', 'keysh3d-fx-camdist-val');
+            hydrateFxRangeIn('camTilt', 'keysh3d-fx-camtilt', 'keysh3d-fx-camtilt-val');
+            const storedCamera = localStorage.getItem('keys3d_bg_camera');
+            const cameraSel = document.getElementById('keysh3d-fx-camera');
+            if (storedCamera && Array.from(cameraSel.options).some(o => o.value === storedCamera)) {
+                cameraSel.value = storedCamera;
+            }
             const storedStyle = localStorage.getItem('keys3d_bg_style');
             const styleSel = document.getElementById('keysh3d-fx-bgstyle');
             if (storedStyle && Array.from(styleSel.options).some(o => o.value === storedStyle)) {
@@ -199,6 +285,11 @@
             const themeSel = document.getElementById('keysh3d-fx-theme');
             if (storedTheme && Array.from(themeSel.options).some(o => o.value === storedTheme)) {
                 themeSel.value = storedTheme;
+            }
+            const storedPalette = localStorage.getItem('keys3d_bg_palette');
+            const paletteSel = document.getElementById('keysh3d-fx-palette');
+            if (storedPalette && Array.from(paletteSel.options).some(o => o.value === storedPalette)) {
+                paletteSel.value = storedPalette;
             }
         } catch (e) {
             console.warn('[Keys-Hwy3D settings] hydration failed:', e);

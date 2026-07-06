@@ -83,6 +83,119 @@
     // pitch class.
     const HAND_BRIGHTNESS = { rh: 1.0, lh: 0.72 };
 
+    // Selectable note-colour palettes. Index = midi % 12, same contract as
+    // PITCH_CLASS_COLORS — which stays byte-identical as the 'classic'
+    // entry, so anyone who never touches the setting sees the stock look.
+    // Two palette families:
+    //   per-pitch  — every pitch class gets its own hue (classic/vivid/pastel)
+    //   two-tone   — naturals share one hue, sharps a darker shade of it, so
+    //                a dark gem always telegraphs "black key coming"
+    //                (emerald/ice)
+    const NOTE_PALETTES = {
+        classic: PITCH_CLASS_COLORS,
+        emerald: [
+            0x3fe25f, // C  — bright green (naturals)
+            0x17863a, // C# — dark green (sharps)
+            0x3fe25f, // D
+            0x17863a, // D#
+            0x3fe25f, // E
+            0x3fe25f, // F
+            0x17863a, // F#
+            0x3fe25f, // G
+            0x17863a, // G#
+            0x3fe25f, // A
+            0x17863a, // A#
+            0x3fe25f, // B
+        ],
+        vivid: [
+            0xff2020, // C
+            0xd45a10, // C#
+            0xffe000, // D
+            0xb8c010, // D#
+            0x1e6aff, // E
+            0x9fd0e8, // F
+            0x2fae7e, // F#
+            0x20e050, // G
+            0xa89a20, // G#
+            0xff8a00, // A
+            0xd05888, // A#
+            0xd040ff, // B
+        ],
+        pastel: [
+            0xff9a9a, // C
+            0xd0a078, // C#
+            0xffe9a0, // D
+            0xcfd08a, // D#
+            0x9ec0ff, // E
+            0xc8dde8, // F
+            0x9ecfba, // F#
+            0x9fe8b0, // G
+            0xcfc79a, // G#
+            0xffc890, // A
+            0xd8a8ba, // A#
+            0xe0b0ff, // B
+        ],
+        ice: [
+            0x58c8ff, // C  — bright ice blue (naturals)
+            0x2a6a9a, // C# — deep blue (sharps)
+            0x58c8ff, // D
+            0x2a6a9a, // D#
+            0x58c8ff, // E
+            0x58c8ff, // F
+            0x2a6a9a, // F#
+            0x58c8ff, // G
+            0x2a6a9a, // G#
+            0x58c8ff, // A
+            0x2a6a9a, // A#
+            0x58c8ff, // B
+        ],
+    };
+
+    // Octave-based colour scheme ('octaves'): every octave gets a distinct
+    // hue that steps like a rainbow (clear, uniform sections — NOT a smooth
+    // blend — so each octave is uniquely identifiable, but neighbouring
+    // octaves stay close so the change isn't jarring). Loops if a song runs
+    // past the table. Within an octave, sharps/flats take a darker shade of
+    // the same hue — the same two-tone idea as 'emerald'. Octave index =
+    // floor(midi/12) - 1 (so C1..B1 = octave 1). The three keys below C1
+    // (A0/A#0/B0 = octave 0) and anything lower get a distinct cool slate so
+    // the very bottom of the board reads apart from the red start.
+    const OCTAVE_HUES = [
+        0xe23a3a, // oct 1 (C1–B1)  red
+        0xe2803a, // oct 2          orange
+        0xe0c73a, // oct 3          yellow
+        0x5fc23a, // oct 4          green
+        0x3ac2a0, // oct 5          teal
+        0x3a86e2, // oct 6          blue
+        0x6a4ae2, // oct 7          indigo
+        0xc23ae2, // oct 8 (C8)     magenta
+    ];
+    const OCTAVE_SUBC1_HUE = 0x8090a0;  // A0/A#0/B0 and below — cool slate
+    const OCTAVE_SHARP_DARKEN = 0.5;    // sharps render at 50% of the octave hue
+    function _darkenHex(hex, f) {
+        const r = Math.round(((hex >> 16) & 0xff) * f);
+        const g = Math.round(((hex >> 8) & 0xff) * f);
+        const b = Math.round((hex & 0xff) * f);
+        return (r << 16) | (g << 8) | b;
+    }
+    function _isBlackPc(midi) {
+        return [1, 3, 6, 8, 10].indexOf(((midi % 12) + 12) % 12) !== -1;
+    }
+    // Colour (24-bit int) for a midi note under the octave scheme: hue by
+    // octave, darker for sharps. Pure (no THREE) so it is unit-testable.
+    function octaveNoteColor(midi) {
+        const oct = Math.floor(midi / 12) - 1;      // C1..B1 => 1
+        let hex = (oct <= 0)
+            ? OCTAVE_SUBC1_HUE
+            : OCTAVE_HUES[(oct - 1) % OCTAVE_HUES.length];
+        if (_isBlackPc(midi)) hex = _darkenHex(hex, OCTAVE_SHARP_DARKEN);
+        return hex;
+    }
+    // Every valid palette id: the 12-entry pitch-class tables PLUS the
+    // procedural 'octaves' scheme (which is not a 12-array, so it lives
+    // outside NOTE_PALETTES and is validated through this list).
+    const PALETTE_IDS = [...Object.keys(NOTE_PALETTES), 'octaves'];
+
     // Note block cross-section height and bevel (world units). The bevel
     // turns the flat slabs into glossy gem-like blocks that catch the light
     // on their edges — the RS+ reference look.
@@ -913,7 +1026,27 @@
         scoreFx: true,    // 2D overlay: +N pops, combo rings, streak-break wash
         bgIntensity: 0.5, // background-ambience density/strength
         bgReactive: true, // background reacts to the audio analyser
+        // Camera base-rig fine-tune. These shift the BASE vantage point the
+        // auto-pan/zoom follow-motion is built on (they multiply/offset the
+        // active CAM_PRESET before the per-frame pan + dolly), so the camera
+        // still tracks the notes — just from a nudged height/distance/tilt.
+        camHeight: 1.0,   // ×preset camera height (higher = more overhead)
+        camDist: 1.0,     // ×preset camera distance (larger = further back)
+        camTilt: -0.6,    // aim offset up(+)/down(−); default paired with the overhead rig for the tuned piano view
     };
+    // Numeric FX keys clamp to a declared [min, max]; keys absent from this
+    // table keep the historical 0–1 slider range. The camera fine-tune knobs
+    // are multipliers/offsets centred on 1 (or 0), so they need headroom and a
+    // floor a 0–1 range couldn't express.
+    const FX_RANGES = {
+        camHeight: [0.4, 2.2],
+        camDist: [0.4, 2.2],
+        camTilt: [-1.0, 1.0],
+    };
+    function _fxClamp(key, n) {
+        const r = FX_RANGES[key] || [0, 1];
+        return Math.min(r[1], Math.max(r[0], n));
+    }
     const FX_LS_PREFIX = 'keys3d_bg_';
     // Theme id lives OUTSIDE FX_DEFAULTS (string, not bool/number) — its own
     // localStorage key + validation against BG_THEMES.
@@ -1090,6 +1223,58 @@
         } catch (_) { /* dispatch unavailable — persisted value applies next init */ }
     };
 
+    // Note-colour palette id — string-valued like the theme, so it gets its
+    // own validated key + setter rather than an FX_DEFAULTS slot.
+    const FX_LS_PALETTE = 'keys3d_bg_palette';
+    function readPaletteSetting() {
+        try {
+            const id = localStorage.getItem(FX_LS_PALETTE);
+            if (id && PALETTE_IDS.indexOf(id) !== -1) return id;
+        } catch (_) {}
+        // Default: the octave scheme (each octave its own colour, darker
+        // sharps) — the plug-and-play piano look. Emerald/classic/etc. remain
+        // selectable.
+        return 'octaves';
+    }
+    window.keys3dSetPalette = function (id) {
+        if (PALETTE_IDS.indexOf(id) === -1) return;
+        try { localStorage.setItem(FX_LS_PALETTE, id); } catch (_) {}
+        try {
+            window.dispatchEvent(new CustomEvent('keys3d:settings', { detail: { palette: id } }));
+        } catch (_) { /* dispatch unavailable — persisted value applies next init */ }
+    };
+
+    // Camera-rig presets. 'classic' is the original low, near-telephoto rig
+    // (numerically identical to the historical constants, so an untouched
+    // setting keeps the stock framing). y/z/lookY/lookZ are in pre-K world
+    // units — the instance multiplies by K at the use sites, same as the old
+    // constants did. Zoom scales position AND look-at every frame, so all
+    // presets inherit the adaptive dolly behaviour unchanged.
+    const CAM_PRESETS = {
+        classic:  { fov: 40, y: 46,  z: 112, lookY: 8, lookZ: -165 },
+        elevated: { fov: 44, y: 78,  z: 118, lookY: 4, lookZ: -150 },
+        overhead: { fov: 48, y: 118, z: 74,  lookY: 0, lookZ: -115 },
+    };
+    // Camera preset id — string-valued like the theme, so it gets its own
+    // validated key + setter rather than an FX_DEFAULTS slot.
+    const FX_LS_CAMERA = 'keys3d_bg_camera';
+    function readCameraSetting() {
+        try {
+            const id = localStorage.getItem(FX_LS_CAMERA);
+            if (id && CAM_PRESETS[id]) return id;
+        } catch (_) {}
+        // Default: the overhead reading rig — paired with the camTilt default
+        // below it gives the tuned plug-and-play piano view. Others selectable.
+        return 'overhead';
+    }
+    window.keys3dSetCamera = function (id) {
+        if (!CAM_PRESETS[id]) return;
+        try { localStorage.setItem(FX_LS_CAMERA, id); } catch (_) {}
+        try {
+            window.dispatchEvent(new CustomEvent('keys3d:settings', { detail: { camera: id } }));
+        } catch (_) { /* dispatch unavailable — persisted value applies next init */ }
+    };
+
     function readFxSettings() {
         const fx = Object.assign({}, FX_DEFAULTS);
         try {
@@ -1104,10 +1289,10 @@
                     else if (raw === '0' || raw === 'false') fx[k] = false;
                 } else {
                     const n = parseFloat(raw);
-                    // All numeric FX keys are 0-1 sliders — clamp so a
-                    // corrupt/foreign write can't overdrive opacities
-                    // or the camera pulse.
-                    if (Number.isFinite(n)) fx[k] = Math.min(1, Math.max(0, n));
+                    // Numeric FX keys clamp to their declared range
+                    // (default 0-1) so a corrupt/foreign write can't
+                    // overdrive opacities or the geometry multipliers.
+                    if (Number.isFinite(n)) fx[k] = _fxClamp(k, n);
                 }
             }
         } catch (_) { /* localStorage unavailable — use defaults */ }
@@ -1127,7 +1312,7 @@
         } else {
             v = Number(value);
             if (!Number.isFinite(v)) return;
-            v = Math.min(1, Math.max(0, v));   // all numeric FX keys are 0-1
+            v = _fxClamp(key, v);   // declared range, default 0-1
         }
         try {
             localStorage.setItem(FX_LS_PREFIX + key, typeof v === 'boolean' ? (v ? '1' : '0') : String(v));
@@ -1369,6 +1554,7 @@
         // Theme/material handles (built by buildScene/buildKeyboardAndHighway;
         // _applyTheme / _applyCinematic / the glow slider retune them live).
         let _theme = readThemeSetting();
+        let _palette = readPaletteSetting();
         let ambLight = null, dirLight = null;
         let _floorMat = null;
         const _railMats = [];      // lane-edge rail materials (theme laneDim)
@@ -1432,8 +1618,20 @@
             return [1, 3, 6, 8, 10].includes(((midi % 12) + 12) % 12);
         }
 
+        function _paletteColor(pc) {
+            return (NOTE_PALETTES[_palette] || PITCH_CLASS_COLORS)[pc];
+        }
+
+        // Base colour (24-bit int, no hand dimming) for a midi note under the
+        // active palette — the octave scheme is procedural, every other
+        // palette is a 12-entry pitch-class table.
+        function _noteHex(midi) {
+            if (_palette === 'octaves') return octaveNoteColor(midi);
+            return _paletteColor(((midi % 12) + 12) % 12);
+        }
+
         function noteColor(midi, hand) {
-            const base = new T.Color(PITCH_CLASS_COLORS[((midi % 12) + 12) % 12]);
+            const base = new T.Color(_noteHex(midi));
             const b = HAND_BRIGHTNESS[hand] != null ? HAND_BRIGHTNESS[hand] : 1.0;
             base.multiplyScalar(b);
             return base;
@@ -1461,14 +1659,15 @@
         const BLACK_W = 6.4 * K, BLACK_L = 28 * K, BLACK_H = 6.5 * K;
         const HIGHWAY_LEN = 1150 * K; // longer runway → ~8.8s of lookahead visible
 
-        // Camera — low, near-telephoto rig (RS+-style): a narrow FOV from low
-        // and back gives a deep receding runway and frames ~2 octaves instead
-        // of cramming the whole note range full-width. The x position pans to
-        // follow the active notes (see updateScene), so wide pieces stay zoomed
-        // in on the played hand rather than shrinking every key.
-        const CAM_FOV = 40;
-        const CAM_Y = 46 * K, CAM_Z = 112 * K;
-        const LOOK_Y = 8 * K, LOOK_Z = -165 * K;
+        // Camera — the default 'classic' preset is a low, near-telephoto rig
+        // (RS+-style): a narrow FOV from low and back gives a deep receding
+        // runway and frames ~2 octaves instead of cramming the whole note
+        // range full-width. The x position pans to follow the active notes
+        // (see updateScene), so wide pieces stay zoomed in on the played hand
+        // rather than shrinking every key. The rig numbers now come from the
+        // user-selectable CAM_PRESETS table; switching applies live because
+        // position/lookAt are re-derived every frame.
+        let _camPreset = CAM_PRESETS[readCameraSetting()] || CAM_PRESETS.classic;
         // Pan-follow: a slow ease toward a wide, gently-weighted centroid so the
         // camera glides with the melody instead of darting as notes enter/leave.
         const CAM_PAN_LERP = 0.022;      // per-frame ease (~1s glide @60fps)
@@ -1484,6 +1683,22 @@
         const CAM_ZOOM_BASE_KEYS = 11;   // white keys framed at zoom = 1
         const CAM_ZOOM_MIN = 0.9, CAM_ZOOM_MAX = 4.8;
         const CAM_ZOOM_LERP = 0.025;     // smooth zoom ease
+        // Full-swing of the camTilt aim offset (pre-K units) at slider ±1.
+        const CAM_TILT_UNITS = 55;
+
+        // Base rig with the live fine-tune knobs applied — height/distance
+        // multiply the preset, tilt offsets the aim height. Returns the
+        // effective {y, z, lookY, lookZ} in pre-K units; the caller scales by
+        // K and the auto-zoom. Keeps the pan/dolly follow-motion intact —
+        // these only move the vantage point it orbits around.
+        function _rig() {
+            return {
+                y: _camPreset.y * fx.camHeight,
+                z: _camPreset.z * fx.camDist,
+                lookY: _camPreset.lookY + fx.camTilt * CAM_TILT_UNITS,
+                lookZ: _camPreset.lookZ,
+            };
+        }
         // Per-key approach glow: a key lights in its pitch-class colour ONLY while a
         // note is heading for it, ramping up the closer that note gets to the hit-line.
         const KEY_GLOW_AHEAD = 2.0;      // seconds before the hit-line a key starts to light
@@ -1945,10 +2160,9 @@
             _envRT = _makeStudioEnv(T, ren);
             if (_envRT) scene.environment = _envRT.texture;
 
-            cam = new T.PerspectiveCamera(CAM_FOV, 1, 0.1, 2000 * K);
+            cam = new T.PerspectiveCamera(_camPreset.fov, 1, 0.1, 2000 * K);
             _camX = 0; _camTargetX = 0; _camZoom = 1; _camTargetZoom = 1;
-            cam.position.set(0, CAM_Y, CAM_Z);
-            cam.lookAt(0, LOOK_Y, LOOK_Z);
+            { const r = _rig(); cam.position.set(0, r.y * K, r.z * K); cam.lookAt(0, r.lookY * K, r.lookZ * K); }
 
             ambLight = new T.AmbientLight(0xffffff, 0.75);
             dirLight = new T.DirectionalLight(0xffffff, 1.1);
@@ -2091,13 +2305,16 @@
             return geo;
         }
 
-        // Glossy note material, cached per (pitch class, hand).
+        // Glossy note material, cached per resolved colour. Keying by the
+        // final colour int (hand brightness already baked in by noteColor)
+        // works for every palette — including 'octaves', where two notes of
+        // the same pitch class in different octaves are DIFFERENT colours and
+        // must not share a material (a pitch-class key would collide them).
         function _noteMaterial(midi, hand) {
-            const handKey = HAND_BRIGHTNESS[hand] != null ? hand : 'rh';
-            const key = (((midi % 12) + 12) % 12) + '|' + handKey;
+            const col = noteColor(midi, hand);
+            const key = col.getHex();
             let mat = _noteMatCache.get(key);
             if (mat) return mat;
-            const col = noteColor(midi, hand);
             // MeshPhysicalMaterial with a clearcoat: lacquered glass-gem
             // look — a sharp coat highlight over a colored body, lit by the
             // studio env map. This is the "not plastic" ask: the old matte
@@ -2145,6 +2362,39 @@
             for (const m of _laneGuideMats) m.opacity = lop;
         }
 
+        // Live palette switch: recolour everything already built — cached
+        // note materials (future clones), per-note clones, key emissives
+        // (incl. the wrong-flash restore state), lane guides — and drop the
+        // pitch-class flame textures so the next spawn bakes the new hues.
+        // Same no-rebuild approach as _applyVibrancy.
+        function _applyPalette() {
+            // The base-material cache is keyed by resolved colour, so old
+            // entries are simply stale under a new palette — drop them and let
+            // the next build re-cache. The live per-note clones below are
+            // retinted directly from each note's midi (palette-correct).
+            for (const m of _noteMatCache.values()) m.dispose();
+            _noteMatCache.clear();
+            for (const nm of noteMeshes) {
+                if (!nm.mesh || !nm.mesh.material) continue;
+                const col = noteColor(nm.note.midi, nm.note.hand);
+                nm.mesh.material.color.copy(col);
+                nm.mesh.material.emissive.copy(col);
+            }
+            for (const [midi, km] of keyMeshes) {
+                const col = noteColor(midi, 'rh');
+                km.material.emissive.copy(col);
+                km.userData.origEmissive = col.getHex();
+            }
+            for (const m of _laneGuideMats) {
+                if (m.userData.midi != null) m.color.copy(noteColor(m.userData.midi, 'rh'));
+            }
+            _clearFlameTextures();
+            // Re-arm the pool so no slot keeps rendering a disposed texture
+            // (a flame mid-flight briefly re-tints — next spawn sets its
+            // true pitch texture).
+            for (const s of _flamePool) s.mat.map = _flameTexture(0);
+        }
+
         function _barNumberTexture(idx) {
             let tex = _barTexCache.get(idx);
             if (tex) return tex;
@@ -2181,13 +2431,15 @@
             return _glowTex;
         }
 
-        // Vertical flame texture for hit flares: white-hot base fading up
-        // into the pitch-class colour, with a horizontal falloff. Cached per
-        // pitch class (bounded, 12 entries).
-        function _flameTexture(pc) {
-            let tex = _flameTexCache.get(pc);
+        // Vertical flame texture for hit flares / held-key halos: white-hot
+        // base fading up into the note's colour, with a horizontal falloff.
+        // Cached per resolved colour (bounded — 12 for pitch-class palettes,
+        // up to ~one-per-octave for 'octaves'), so a flare always matches the
+        // struck note's colour whatever the palette.
+        function _flameTexture(midi) {
+            const c = _noteHex(midi);
+            let tex = _flameTexCache.get(c);
             if (tex) return tex;
-            const c = PITCH_CLASS_COLORS[pc];
             const r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
             const cnv = document.createElement('canvas');
             cnv.width = 64;
@@ -2207,7 +2459,7 @@
             ctx.fillStyle = falloff;
             ctx.fillRect(0, 0, 64, 128);
             tex = new T.CanvasTexture(cnv);
-            _flameTexCache.set(pc, tex);
+            _flameTexCache.set(c, tex);
             return tex;
         }
 
@@ -2294,7 +2546,7 @@
             if (!entry) return;
             const slot = _flamePool[_flameIdx];
             _flameIdx = (_flameIdx + 1) % _flamePool.length;
-            slot.mat.map = _flameTexture(((midi % 12) + 12) % 12);
+            slot.mat.map = _flameTexture(midi);
             slot.start = wallNow;
             slot.baseY = entry.black ? BLACK_H + WHITE_H * 0.6 : WHITE_H;
             slot.sprite.position.x = keyX(entry, _layoutInfo.whiteCount);
@@ -2382,6 +2634,7 @@
                     color: noteColor(midi, 'rh'), transparent: true,
                     opacity: _laneGuideOpacity(), depthWrite: false,
                 });
+                gmat.userData.midi = midi; // palette retint needs the lane's pitch
                 _laneGuideMats.push(gmat);
                 const strip = new T.Mesh(new T.PlaneGeometry(WHITE_W * 0.84, guideLen), gmat);
                 strip.rotation.x = -Math.PI / 2;
@@ -2775,8 +3028,7 @@
             }
             _camX += (_camTargetX - _camX) * CAM_PAN_LERP;
             _camZoom += (_camTargetZoom - _camZoom) * CAM_ZOOM_LERP;
-            cam.position.set(_camX, CAM_Y * _camZoom, CAM_Z * _camZoom);
-            cam.lookAt(_camX, LOOK_Y * _camZoom, LOOK_Z * _camZoom);
+            { const r = _rig(); cam.position.set(_camX, r.y * K * _camZoom, r.z * K * _camZoom); cam.lookAt(_camX, r.lookY * K * _camZoom, r.lookZ * K * _camZoom); }
 
             for (const km of keyMeshes.values()) km.userData.glow = 0;
             for (const { mesh, note, len, label } of noteMeshes) {
@@ -3217,9 +3469,12 @@
                 if (_isReady) teardown();
                 highwayCanvas = canvas;
                 fx = readFxSettings();
-                // Persisted string settings refresh here too — a theme saved
-                // while no instance was listening must not come up stale on a
-                // later init().
+                // Persisted string settings refresh here too — a palette,
+                // camera, theme or background style saved while no instance was
+                // listening (e.g. changed on the Settings screen, where the live
+                // viz is torn down) must not come up stale on a later init().
+                _palette = readPaletteSetting();
+                _camPreset = CAM_PRESETS[readCameraSetting()] || CAM_PRESETS.classic;
                 _theme = readThemeSetting();
                 _bgStyle = readBgStyleSetting();
                 loadThree().then(() => {
@@ -3264,6 +3519,19 @@
                         if (d && d.bgStyle && BG_STYLE_IDS.indexOf(d.bgStyle) !== -1) {
                             _bgStyle = d.bgStyle;
                             _bgMountStyle();
+                        }
+                        if (d && d.palette && PALETTE_IDS.indexOf(d.palette) !== -1) {
+                            _palette = d.palette;
+                            _applyPalette();
+                        }
+                        if (d && d.camera && CAM_PRESETS[d.camera]) {
+                            _camPreset = CAM_PRESETS[d.camera];
+                            // Position/lookAt re-derive next frame; only the
+                            // projection needs an explicit poke.
+                            if (cam) {
+                                cam.fov = _camPreset.fov;
+                                cam.updateProjectionMatrix();
+                            }
                         }
                     };
                     window.addEventListener('keys3d:settings', _fxThemeHandler);
@@ -3470,10 +3738,19 @@
         readFxSettings,
         readThemeSetting,
         readBgStyleSetting,
+        readPaletteSetting,
+        readCameraSetting,
         _bgThemeColors,
         BG_THEMES,
         BG_STYLE_IDS,
+        NOTE_PALETTES,
+        PITCH_CLASS_COLORS,
+        PALETTE_IDS,
+        OCTAVE_HUES,
+        octaveNoteColor,
+        CAM_PRESETS,
         FX_DEFAULTS,
+        FX_RANGES,
         _classifyTiming,
     };
 
