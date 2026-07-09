@@ -1601,6 +1601,41 @@
     }
 
     /* ======================================================================
+     *  Camera Director bridge resolver (pure — exported via createFactory.__test)
+     * ====================================================================== */
+
+    /**
+     * The active splitscreen API, defensive on the global-name rename in flight
+     * (feedBackSplitscreen is canonical; slopsmithSplitscreen is the legacy alias).
+     * @returns {object|null} the splitscreen API, or null when not present
+     */
+    function _ssApi() { return window.feedBackSplitscreen || window.slopsmithSplitscreen || null; }
+
+    /**
+     * Resolve the Camera Director camera for a canvas: this panel's camera under
+     * splitscreen, else the global, else null (Camera Director absent → 100% stock
+     * framing). Throw-safe on panelIndexFor so a misbehaving splitscreen build
+     * can't break framing.
+     * @param {HTMLCanvasElement} canvas this renderer's highway canvas
+     * @param {object|null} ss the splitscreen API (see _ssApi)
+     * @param {object|null} panelsMap window.__h3dCamCtlPanels (per-panel cameras by index)
+     * @param {object|null} globalCam window.__h3dCamCtl (single global camera)
+     * @returns {object|null} the resolved free-camera bridge, or null
+     */
+    function _resolveFreeCam(canvas, ss, panelsMap, globalCam) {
+        if (panelsMap && ss && typeof ss.panelIndexFor === 'function') {
+            try {
+                const i = ss.panelIndexFor(canvas);
+                // Only a non-negative integer indexes the panel map — a non-int /
+                // negative / string index (or a prototype key) must not resolve an
+                // unintended/inherited property; fall through to the global then.
+                if (Number.isInteger(i) && i >= 0 && panelsMap[i]) return panelsMap[i];
+            } catch (e) { /* ignore */ }
+        }
+        return globalCam || null;
+    }
+
+    /* ======================================================================
      *  Renderer factory
      * ====================================================================== */
 
@@ -1848,6 +1883,18 @@
             _rigOut.lookY = _camPreset.lookY + fx.camTilt * CAM_TILT_UNITS;
             _rigOut.lookZ = _camPreset.lookZ;
             return _rigOut;
+        }
+
+        /**
+         * Camera Director bridge for THIS panel — delegates to the pure, unit-
+         * tested _resolveFreeCam / _ssApi (resolver block above the factory).
+         * Reads the live globals: per-panel map __h3dCamCtlPanels → this panel's
+         * camera, else the global __h3dCamCtl, else null (stock framing).
+         * @param {HTMLCanvasElement} canvas this panel's highway canvas
+         * @returns {object|null} the resolved free-camera bridge, or null
+         */
+        function _freeCamFor(canvas) {
+            return _resolveFreeCam(canvas, _ssApi(), window.__h3dCamCtlPanels, window.__h3dCamCtl);
         }
         // Per-key approach glow: a key lights in its pitch-class color ONLY while a
         // note is heading for it, ramping up the closer that note gets to the hit-line.
@@ -3259,7 +3306,33 @@
             }
             _camX += (_camTargetX - _camX) * CAM_PAN_LERP;
             _camZoom += (_camTargetZoom - _camZoom) * CAM_ZOOM_LERP;
-            { const r = _rig(); cam.position.set(_camX, r.y * K * _camZoom, r.z * K * _camZoom); cam.lookAt(_camX, r.lookY * K * _camZoom, r.lookZ * K * _camZoom); }
+            {
+                const r = _rig();
+                let _cx = _camX, _cy = r.y * K * _camZoom, _cz = r.z * K * _camZoom;
+                let _lx = _camX, _ly = r.lookY * K * _camZoom, _lz = r.lookZ * K * _camZoom;
+                // Camera Director free-cam offsets (per-panel-aware), layered on top
+                // of the auto-framing so pan/zoom-follow still works. Dolly/height/
+                // orbit act on the camera-from-target vector; pan/pitch shift the
+                // look target. NaN-safe; null/disabled bridge → stock.
+                const _fc = _freeCamFor(highwayCanvas);
+                if (_fc && _fc.enabled) {
+                    const _dm = Number.isFinite(_fc.distMul) ? _fc.distMul : 1;
+                    const _hm = Number.isFinite(_fc.heightMul) ? _fc.heightMul : 1;
+                    const _yaw = Number.isFinite(_fc.yaw) ? _fc.yaw : 0;
+                    let _vx = _cx - _lx, _vy = _cy - _ly, _vz = _cz - _lz;
+                    _vx *= _dm; _vy *= _dm; _vz *= _dm;   // dolly (zoom)
+                    _vy *= _hm;                            // height
+                    const _cyw = Math.cos(_yaw), _syw = Math.sin(_yaw);
+                    const _rx = _vx * _cyw - _vz * _syw, _rz = _vx * _syw + _vz * _cyw; // orbit around Y
+                    _cx = _lx + _rx; _cy = _ly + _vy; _cz = _lz + _rz;
+                    const _px = Number.isFinite(_fc.panX) ? _fc.panX : 0;
+                    const _py = Number.isFinite(_fc.panY) ? _fc.panY : 0;
+                    const _pt = Number.isFinite(_fc.pitch) ? _fc.pitch : 0;
+                    _lx += _px * K; _ly += (_pt + _py) * K;
+                }
+                cam.position.set(_cx, _cy, _cz);
+                cam.lookAt(_lx, _ly, _lz);
+            }
 
             for (const km of keyMeshes.values()) km.userData.glow = 0;
             for (const { mesh, note, len, label } of noteMeshes) {
@@ -3960,6 +4033,8 @@
     };
     // Pure data-layer + scoring hooks for headless tests.
     window.slopsmithViz_keys_highway_3d.__test = {
+        _resolveFreeCam,
+        _ssApi,
         beatDurSec,
         flattenNotation,
         keyRange,

@@ -2595,10 +2595,51 @@
     }
     const FRET_NUMBER_GHOST_SCOPE_IDS = ['chords', 'all'];
 
+    /**
+     * localStorage panel key for per-panel background settings ('main' or
+     * 'panel<index>'). Defensive on the splitscreen global-name rename in flight,
+     * and throw-safe on panelIndexFor — same as _freeCamFor — so a misbehaving
+     * splitscreen build can't take down background-settings resolution. Only a
+     * non-negative integer index yields a 'panel<N>' key; anything else (null,
+     * NaN, negative, non-integer) falls back to 'main' so a bad index can never
+     * mint a bogus "panelNaN"-style key.
+     * @param {HTMLCanvasElement} canvas this renderer's highway canvas
+     * @returns {string} 'main' or 'panel<index>'
+     */
     function _bgPanelKey(canvas) {
-        const ss = window.feedBackSplitscreen;
-        const idx = (ss && typeof ss.panelIndexFor === 'function') ? ss.panelIndexFor(canvas) : null;
-        return (idx == null) ? 'main' : 'panel' + idx;
+        const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+        let idx = null;
+        if (ss && typeof ss.panelIndexFor === 'function') {
+            try { idx = ss.panelIndexFor(canvas); } catch (e) { idx = null; }
+        }
+        return (Number.isInteger(idx) && idx >= 0) ? 'panel' + idx : 'main';
+    }
+
+    /**
+     * Camera Director bridge resolver. Prefers THIS panel's per-panel camera under
+     * splitscreen (window.__h3dCamCtlPanels[panelIndex]) and falls back to the
+     * single global (window.__h3dCamCtl); returns null when Camera Director is
+     * absent → 100% stock framing. Defensive on the splitscreen global-name rename
+     * in flight (feedBackSplitscreen vs slopsmithSplitscreen); throw-safe on
+     * panelIndexFor. Mirrors the panel resolution in _bgPanelKey.
+     * @param {HTMLCanvasElement} canvas this renderer's highway canvas
+     * @returns {object|null} the resolved free-camera bridge, or null
+     */
+    function _freeCamFor(canvas) {
+        const map = window.__h3dCamCtlPanels;
+        if (map) {
+            const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+            if (ss && typeof ss.panelIndexFor === 'function') {
+                try {
+                    const i = ss.panelIndexFor(canvas);
+                    // Only a non-negative integer indexes the map (same hardening
+                    // as _bgPanelKey) — a non-int / negative / string index must not
+                    // resolve an unintended/inherited property; fall through then.
+                    if (Number.isInteger(i) && i >= 0 && map[i]) return map[i];
+                } catch (e) { /* ignore */ }
+            }
+        }
+        return window.__h3dCamCtl || null;
     }
     // In-memory fallback for when localStorage is blocked (private mode,
     // sandboxed iframes, some test runners). _bgWriteGlobal stages the
@@ -14664,7 +14705,10 @@
             // suppressed while the Camera Director owns the view (it wins).
             const _startAspect = (_tune && Number.isFinite(_tune.startAspect) && _tune.startAspect > 0)
                 ? _tune.startAspect : HORPLUS_START_ASPECT;
-            const _dirActive = !!(window.__h3dCamCtl && window.__h3dCamCtl.enabled);
+            // Resolve the Camera Director bridge once (per-panel under splitscreen,
+            // else global). Used both for the wide-pane gate and the transforms below.
+            const _freeCam = _freeCamFor(highwayCanvas);
+            const _dirActive = !!(_freeCam && _freeCam.enabled);
             const _wide = !!(_tune && _paneAspect > _startAspect) && !_dirActive;
             const _poseHMul = (_wide && Number.isFinite(_tune.heightMul)) ? _tune.heightMul : 1;
             const _poseDMul = (_wide && Number.isFinite(_tune.distMul)) ? _tune.distMul : 1;
@@ -14691,13 +14735,16 @@
             if (_poseHMul !== 1) _camY *= _poseHMul;
             if (_poseDMul !== 1) _camZ *= _poseDMul;
             // ── Free-camera user tweaks (orbit / height / zoom / pan) ──
-            // Driven by the Camera Director plugin via window.__h3dCamCtl.
+            // Driven by the Camera Director plugin via the camera bridge:
+            // window.__h3dCamCtlPanels[panelIndexFor(canvas)] when split (this
+            // panel's own camera), falling back to the global window.__h3dCamCtl.
             // Layered ON TOP of the auto-framing so note tracking still works.
             // The bridge is read once into _freeCam and reused for both the
             // position and the look-at transforms; every field is coerced to a
             // finite number before use so a malformed object can never feed NaN
             // into cam.position / cam.lookAt.
-            const _freeCam = window.__h3dCamCtl;
+            // _freeCam resolved above via _freeCamFor(highwayCanvas): the
+            // per-panel __h3dCamCtlPanels entry, else global __h3dCamCtl, else null.
             const _lookAtZ = -FOCUS_D * 0.35 * _poseLookZMul;
             if (_freeCam && _freeCam.enabled) {
                 const _distMul = Number.isFinite(_freeCam.distMul) ? _freeCam.distMul : 1;
