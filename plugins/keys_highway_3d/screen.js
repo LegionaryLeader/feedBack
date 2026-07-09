@@ -1601,6 +1601,29 @@
     }
 
     /* ======================================================================
+     *  Camera Director bridge resolver (pure — exported via createFactory.__test)
+     * ====================================================================== */
+
+    // Resolve the active splitscreen API, defensive on the global-name rename in
+    // flight (feedBackSplitscreen is canonical; slopsmithSplitscreen is the legacy
+    // alias). Returns null when splitscreen isn't present.
+    function _ssApi() { return window.feedBackSplitscreen || window.slopsmithSplitscreen || null; }
+
+    // Given the splitscreen API, THIS window's per-panel camera map, and the
+    // global camera, return this panel's camera under splitscreen, else the
+    // global, else null (Camera Director absent → 100% stock framing). Throw-safe
+    // on panelIndexFor so a misbehaving splitscreen build can't break framing.
+    function _resolveFreeCam(canvas, ss, panelsMap, globalCam) {
+        if (panelsMap && ss && typeof ss.panelIndexFor === 'function') {
+            try {
+                const i = ss.panelIndexFor(canvas);
+                if (i != null && panelsMap[i]) return panelsMap[i];
+            } catch (e) { /* ignore */ }
+        }
+        return globalCam || null;
+    }
+
+    /* ======================================================================
      *  Renderer factory
      * ====================================================================== */
 
@@ -1850,23 +1873,12 @@
             return _rigOut;
         }
 
-        // Camera Director bridge resolver. Prefers THIS panel's per-panel camera
-        // under splitscreen (window.__h3dCamCtlPanels[panelIndex]) and falls back
-        // to the single global (window.__h3dCamCtl); null when Camera Director is
-        // absent → 100% stock framing. Defensive on the splitscreen global name
-        // (rename in flight: feedBackSplitscreen vs slopsmithSplitscreen).
+        // Camera Director bridge for THIS panel — delegates to the pure, unit-
+        // tested _resolveFreeCam / _ssApi (see the resolver block above the
+        // factory). Reads the live globals: per-panel map __h3dCamCtlPanels →
+        // this panel's camera, else the global __h3dCamCtl, else null (stock).
         function _freeCamFor(canvas) {
-            const map = window.__h3dCamCtlPanels;
-            if (map) {
-                const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
-                if (ss && typeof ss.panelIndexFor === 'function') {
-                    try {
-                        const i = ss.panelIndexFor(canvas);
-                        if (i != null && map[i]) return map[i];
-                    } catch (e) { /* ignore */ }
-                }
-            }
-            return window.__h3dCamCtl || null;
+            return _resolveFreeCam(canvas, _ssApi(), window.__h3dCamCtlPanels, window.__h3dCamCtl);
         }
         // Per-key approach glow: a key lights in its pitch-class color ONLY while a
         // note is heading for it, ramping up the closer that note gets to the hit-line.
@@ -4005,6 +4017,8 @@
     };
     // Pure data-layer + scoring hooks for headless tests.
     window.slopsmithViz_keys_highway_3d.__test = {
+        _resolveFreeCam,
+        _ssApi,
         beatDurSec,
         flattenNotation,
         keyRange,

@@ -1362,6 +1362,29 @@
     };
 
     /* ======================================================================
+     *  Camera Director bridge resolver (pure — exported via createFactory.__test)
+     * ====================================================================== */
+
+    // Resolve the active splitscreen API, defensive on the global-name rename in
+    // flight (feedBackSplitscreen is canonical; slopsmithSplitscreen is the legacy
+    // alias). Returns null when splitscreen isn't present.
+    function _ssApi() { return window.feedBackSplitscreen || window.slopsmithSplitscreen || null; }
+
+    // Given the splitscreen API, THIS window's per-panel camera map, and the
+    // global camera, return this panel's camera under splitscreen, else the
+    // global, else null (Camera Director absent → stock framing). Throw-safe on
+    // panelIndexFor so a misbehaving splitscreen build can't break framing.
+    function _resolveFreeCam(canvas, ss, panelsMap, globalCam) {
+        if (panelsMap && ss && typeof ss.panelIndexFor === 'function') {
+            try {
+                const i = ss.panelIndexFor(canvas);
+                if (i != null && panelsMap[i]) return panelsMap[i];
+            } catch (e) { /* ignore */ }
+        }
+        return globalCam || null;
+    }
+
+    /* ======================================================================
      *  Renderer factory
      * ====================================================================== */
 
@@ -1414,7 +1437,7 @@
         let _sparkPts = null, _sparkPos = null, _sparkCol = null, _sparkVel = null, _sparkLife = null;
         let _fxLastWall = 0;          // wall clock for FX integration (sparks, pulse decay)
         let _kickPulse = 0;           // kick-hit camera-dip + floor-wash envelope
-        let _camBaseH = 0, _camBaseD = 0;  // positionCamera's unpulsed pose
+        let _camBaseH = null, _camBaseD = null;  // positionCamera's unpulsed pose (null until it first runs; applyCamera's guard depends on this)
         let _gaussTex = null;         // shared soft-falloff texture for flash quads
         let _laneFlashQuads = [];     // pooled additive quad per hand lane (z=0)
         let _kickFlashQuad = null;    // full-width flash quad for the kick bar
@@ -2651,23 +2674,12 @@
             cam.lookAt(0, 0, -AHEAD * TS * 0.45);
         }
 
-        // Camera Director bridge resolver. Prefers THIS panel's per-panel camera
-        // under splitscreen (window.__h3dCamCtlPanels[panelIndex]) and falls back
-        // to the single global (window.__h3dCamCtl); null when Camera Director is
-        // absent → 100% stock framing. Defensive on the splitscreen global name
-        // (rename in flight: feedBackSplitscreen vs slopsmithSplitscreen).
+        // Camera Director bridge for THIS panel — delegates to the pure, unit-
+        // tested _resolveFreeCam / _ssApi (see the resolver block above the
+        // factory). Reads the live globals: per-panel map __h3dCamCtlPanels →
+        // this panel's camera, else the global __h3dCamCtl, else null (stock).
         function _freeCamFor(canvas) {
-            const map = window.__h3dCamCtlPanels;
-            if (map) {
-                const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
-                if (ss && typeof ss.panelIndexFor === 'function') {
-                    try {
-                        const i = ss.panelIndexFor(canvas);
-                        if (i != null && map[i]) return map[i];
-                    } catch (e) { /* ignore */ }
-                }
-            }
-            return window.__h3dCamCtl || null;
+            return _resolveFreeCam(canvas, _ssApi(), window.__h3dCamCtlPanels, window.__h3dCamCtl);
         }
 
         // Per-frame camera write: static base pose (positionCamera) + kick-pulse Y
@@ -3617,6 +3629,8 @@
     // vm-loaded with no DOM/WebGL; everything here must stay side-effect
     // free to call).
     window.slopsmithViz_drum_highway_3d.__test = {
+        _resolveFreeCam,
+        _ssApi,
         _variantForHit,
         _classifyTiming,
         readFxSettings,
