@@ -19,6 +19,46 @@
     // version against breakages from upstream Three.js drift.
     const THREE_URL = '/static/vendor/three/three.module.min.js';
     const THREE_CDN = 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js';
+    // ── Whammy (Floyd Rose tremolo) model preview ─────────────────────────
+    // A selectable glTF model rendered on the neck. The dropdown picks one of
+    // the three models (or 'off'); all follow the chart the same way, differing
+    // only in mesh. Live controls: model, fret offset, distance off strings,
+    // height. Rotation + size are baked defaults (WHAMMY_ROT_*/WHAMMY_SCALE_MUL).
+    // Intended to be gated to harmonic notes once fully dialled in.
+    const WHAMMY_MODELS = {
+        '01': '/api/plugins/highway_3d/assets/whammy_01.glb',
+        '02': '/api/plugins/highway_3d/assets/whammy_02_streight.glb',
+        '03': '/api/plugins/highway_3d/assets/whammy_03_simple.glb',
+    };
+    const WHAMMY_MODEL_IDS = ['off', '01', '02', '03'];
+    // Baked transform (were live sliders, now fixed): rotated 270° about X,
+    // uniform-scaled 2.17× over the per-model auto-fit base scale.
+    const WHAMMY_ROT_X = 1.5 * Math.PI, WHAMMY_ROT_Y = 0, WHAMMY_ROT_Z = 0;
+    const WHAMMY_SCALE_MUL = 2.17;
+    // Game-consistent look (matches the note-gem / sustain-trail aesthetic — NOT
+    // realistic PBR): a translucent tinted body with a tiny emissive glow that
+    // feeds the existing bloom, plus a subtle additive inverted-hull rim.
+    const WHAMMY_BODY_COLOR = 0x8fb3d9;      // soft steel-blue, sits with the theme
+    const WHAMMY_BODY_OPACITY = 0.55;
+    const WHAMMY_BODY_EMISSIVE_I = 0.25;     // tiny glow, not a blowout
+    const WHAMMY_RIM_COLOR = 0xbfe0ff;
+    const WHAMMY_RIM_OPACITY = 0.5;
+    const WHAMMY_RIM_SCALE = 1.04;           // inverted-hull outline thickness
+    // Fade envelope (seconds). Deliberately long so it eases in/out instead of
+    // flashing; the "full" window spans the tied note's own duration (below).
+    const WHAMMY_FADE_IN = 0.6, WHAMMY_FADE_OUT = 0.6;
+    const WHAMMY_MIN_DUR = 0.25;   // floor so ~zero-sustain notes still animate
+    const WHAMMY_LOOKBACK = 8.0;   // seconds scanned back for long sustains
+    // Bend animation (reserved): the bridge rotates about its anchored BACK edge
+    // (the long axis' back end, derived from the model bbox; WHAMMY_BACK_SIGN
+    // picks which end). The `animG` group in _loadWhammyModel is that pivot; the
+    // per-note-type end poses live in whammy-bend-values.md and aren't wired up
+    // yet (harmonics are only a stand-in trigger, not a dive/pull gesture).
+    const WHAMMY_BACK_SIGN = 1;    // +1 = back is the +axis end, -1 = the -axis end
+    // TEMPORARY: until the real whammy note type exists, trigger on harmonic
+    // notes (natural n.hm / pinch n.hp). Single place to change the trigger.
+    const _whammyIsTriggerNote = (n) => !!(n && (n.hm || n.hp));
+    const GLTFLOADER_URL   = '/static/vendor/three/addons/loaders/GLTFLoader.js';
 
     /* ── Butterchurn audio-reactive background ──────────────────────────
      * Mounts a Butterchurn (WebGL MilkDrop) canvas BEHIND the transparent
@@ -1593,6 +1633,24 @@
         return threeLoadPromise;
     }
 
+    // TEMPORARY (whammy preview): memoized dynamic import of the vendored
+    // GLTFLoader addon. Resolves to the GLTFLoader class. Shares the same
+    // three.module.min.js instance the plugin already loaded (ES modules are
+    // singletons per URL), so loaded meshes are instanceof-compatible with T.
+    let _gltfLoaderPromise = null;
+    function loadGLTFLoader() {
+        if (!_gltfLoaderPromise) {
+            _gltfLoaderPromise = import(GLTFLOADER_URL)
+                .then(mod => mod.GLTFLoader)
+                .catch(e => {
+                    console.error('[3D-Hwy] GLTFLoader load failed:', e);
+                    _gltfLoaderPromise = null;
+                    throw e;
+                });
+        }
+        return _gltfLoaderPromise;
+    }
+
     /* ======================================================================
      *  Splitscreen helpers
      * ====================================================================== */
@@ -2290,7 +2348,20 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', bgTheme: 'default', hwTheme: 'default', showFretOnNote: true, fretNumberGhostScope: 'chords', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: false, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: false, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true, slideArrowApproachVisible: true, slideArrowNeckVisible: true, slideArrowChainPreviewVisible: true, hitFx: 0.7, sparks: true, cinematic: true, verdictMarks: true, timingFx: true, streakFx: true, bloom: true };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', bgTheme: 'default', hwTheme: 'default', showFretOnNote: true, fretNumberGhostScope: 'chords', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: false, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: false, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true, slideArrowApproachVisible: true, slideArrowNeckVisible: true, slideArrowChainPreviewVisible: true, hitFx: 0.7, sparks: true, cinematic: true, verdictMarks: true, timingFx: true, streakFx: true, bloom: true,
+        // Whammy model preview. whammyModel selects which glTF renders (or 'off').
+        // whammyFretOffset (int frets 1..12), whammyDepthFollow (0..1) and
+        // whammyHeight (0..1, 0.5 = strings) are the live controls; rotation and
+        // size are baked constants (WHAMMY_ROT_* / WHAMMY_SCALE_MUL).
+        // whammyPreviewAlways (TEMPORARY): ignore the note trigger and show the
+        // model continuously at the play head, for positioning while a test chart
+        // has few harmonics.
+        // whammyFollow toggles follow-the-chart vs park past the highest fret.
+        // Follow uses fret offset + distance-follow + height; fixed uses its own
+        // distance + position along the neck. Defaults are the tuned follow values.
+        whammyModel: '01', whammyFollow: true, whammyPreviewAlways: false, whammyColor: '#4a60cf',
+        whammyFretOffset: 10, whammyDepthFollow: 0.05, whammyHeight: 0.70,
+        whammyDepthFixed: 0.02, whammyFixedPos: 0.5 };
     // User-selectable, persistable bg styles — must mirror settings.html's
     // VALID_STYLES. 'venue' is deliberately NOT here: it is an internal effective
     // style reached only via _venueSceneOverride (the viz-picker Venue flow), so
@@ -2637,7 +2708,7 @@
     // means (fall back to default rather than silently flipping to
     // false). Add new boolean keys to BG_DEFAULTS and they pick this
     // up via the dispatch below.
-    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible', 'chordDiagramVisible', 'fpsVisible', 'toneHudVisible', 'fretDividersVisible', 'slideArrowApproachVisible', 'slideArrowNeckVisible', 'slideArrowChainPreviewVisible', 'sparks', 'cinematic', 'verdictMarks', 'timingFx', 'streakFx', 'bloom']);
+    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible', 'chordDiagramVisible', 'fpsVisible', 'toneHudVisible', 'fretDividersVisible', 'slideArrowApproachVisible', 'slideArrowNeckVisible', 'slideArrowChainPreviewVisible', 'sparks', 'cinematic', 'verdictMarks', 'timingFx', 'streakFx', 'bloom', 'whammyPreviewAlways', 'whammyFollow']);
     function _bgCoerceBool(val, fallback) {
         if (val === 'true' || val === '1') return true;
         if (val === 'false' || val === '0') return false;
@@ -2647,7 +2718,7 @@
     // hysteresis; zoomSmoothing the zoom dead zone; tiltSmoothing the
     // vertical-tilt deadband + correction strength. All three slider-
     // shaped settings share the same parse + clamp behaviour.
-    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize', 'toneHudSize', 'hitFx']);
+    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize', 'toneHudSize', 'hitFx', 'whammyDepthFollow', 'whammyHeight', 'whammyDepthFixed', 'whammyFixedPos']);
     function _bgCoerce(key, val) {
         if (_BG_FLOAT_KEYS.has(key)) {
             const n = parseFloat(val);
@@ -2671,7 +2742,7 @@
         }
         if (key === 'fretNumberGhostScope')
             return FRET_NUMBER_GHOST_SCOPE_IDS.includes(val) ? val : BG_DEFAULTS.fretNumberGhostScope;
-        if (key === 'nutColor' || key === 'headstockColor') {
+        if (key === 'nutColor' || key === 'headstockColor' || key === 'whammyColor') {
             if (typeof val !== 'string') return BG_DEFAULTS[key];
             const t = val.trim();
             if (/^#[0-9a-fA-F]{6}$/.test(t)) return t.toLowerCase();
@@ -2681,6 +2752,14 @@
             const n = parseInt(val, 10);
             if (!Number.isFinite(n)) return BG_DEFAULTS.fretColumnMarkerCadence;
             return Math.max(0, Math.min(16, n));
+        }
+        // Whammy preview: model id validated against the known set.
+        if (key === 'whammyModel') return WHAMMY_MODEL_IDS.includes(val) ? val : BG_DEFAULTS.whammyModel;
+        // Whammy preview: fret offset is a whole number of frets.
+        if (key === 'whammyFretOffset') {
+            const n = parseInt(val, 10);
+            if (!Number.isFinite(n)) return BG_DEFAULTS.whammyFretOffset;
+            return Math.max(1, Math.min(12, n));
         }
         return val;
     }
@@ -2788,6 +2867,16 @@
     window.h3dBgSetTimingFx     = (v) => _bgWriteGlobal('timingFx', !!v);
     window.h3dBgSetStreakFx     = (v) => _bgWriteGlobal('streakFx', !!v);
     window.h3dBgSetBloom        = (v) => _bgWriteGlobal('bloom', !!v);
+    // Whammy-model preview setters (settings.html "Whammy Model" section).
+    window.h3dBgSetWhammyModel       = (v) => _bgWriteGlobal('whammyModel', v);
+    window.h3dBgSetWhammyFollow      = (v) => _bgWriteGlobal('whammyFollow', !!v);
+    window.h3dBgSetWhammyFretOffset  = (v) => _bgWriteGlobal('whammyFretOffset', v);
+    window.h3dBgSetWhammyDepthFollow = (v) => _bgWriteGlobal('whammyDepthFollow', v);
+    window.h3dBgSetWhammyHeight      = (v) => _bgWriteGlobal('whammyHeight', v);
+    window.h3dBgSetWhammyDepthFixed  = (v) => _bgWriteGlobal('whammyDepthFixed', v);
+    window.h3dBgSetWhammyFixedPos    = (v) => _bgWriteGlobal('whammyFixedPos', v);
+    window.h3dBgSetWhammyPreviewAlways = (v) => _bgWriteGlobal('whammyPreviewAlways', !!v);
+    window.h3dBgSetWhammyColor       = (v) => _bgWriteGlobal('whammyColor', v);
     window.h3dBgSetToneHudVisible   = (v) => _bgWriteGlobal('toneHudVisible', !!v);
     window.h3dBgSetToneHudPosition  = (v) => _bgWriteGlobal('toneHudPosition', v);
     window.h3dBgSetToneHudSize      = (v) => _bgWriteGlobal('toneHudSize', v);
@@ -3747,6 +3836,24 @@
         // ── Per-instance Three.js state ───────────────────────────────────
         let scene = null, cam = null, ren = null;
         let wrap = null;
+        // ── Whammy (Floyd Rose tremolo) model preview state ─────────────────
+        // _whammyModel is a T.Group wrapping the loaded glTF (recentred so it
+        // rotates about its own centre). _whammyBaseScale normalises the raw
+        // model to a sane world size. _whammyLoadedId is the model id currently
+        // loaded/loading (or null); a change vs whammyModel triggers a reload.
+        // _whammyGen invalidates an in-flight async load if the model switches
+        // or teardown runs first.
+        let _whammyModel = null, _whammyBaseScale = 1, _whammyLoadedId = null, _whammyGen = 0;
+        // Live settings mirror (populated by _bgLoadSettings). whammyDepthZ is a
+        // world-space Z offset (negative = up the highway, off the strings) and
+        // whammyHeightY a world-space Y offset from the string mid-line.
+        let whammyModel = BG_DEFAULTS.whammyModel, whammyFretOffset = BG_DEFAULTS.whammyFretOffset;
+        let whammyDepthZ = 0, whammyHeightY = 0, whammyPreviewAlways = false;
+        // whammyFollow: true = follow the chart, false = park past the highest
+        // fret. whammyFixedXOffset is the fixed-mode X nudge; whammyColorHex tints
+        // body + rim live. whammyDepthZ already reflects the active mode's depth.
+        let whammyFollow = BG_DEFAULTS.whammyFollow, whammyFixedXOffset = 0;
+        let whammyColorHex = 0x4a60cf;
         // WebGL context-loss recovery. Switching the active window / alt-tabbing
         // (especially on Windows) can trigger a GPU context reset; with no
         // handler the lost context escalates into a render-process crash. The
@@ -7730,7 +7837,12 @@
                     changedKey === 'projectionVisible' ||
                     changedKey === 'slideArrowApproachVisible' ||
                     changedKey === 'slideArrowNeckVisible' ||
-                    changedKey === 'slideArrowChainPreviewVisible') {
+                    changedKey === 'slideArrowChainPreviewVisible' ||
+                    changedKey === 'whammyModel' || changedKey === 'whammyFollow' ||
+                    changedKey === 'whammyFretOffset' || changedKey === 'whammyDepthFollow' ||
+                    changedKey === 'whammyHeight' || changedKey === 'whammyDepthFixed' ||
+                    changedKey === 'whammyFixedPos' || changedKey === 'whammyPreviewAlways' ||
+                    changedKey === 'whammyColor') {
                     // Flag flips don't need a mesh rebuild — just refresh
                     // the per-instance state for the next frame to consult.
                     // Same shape for showFretOnNote (#12), cameraSmoothing
@@ -8055,6 +8167,23 @@
             slideArrowApproachVisible = _bgReadSetting(panelKey, 'slideArrowApproachVisible');
             slideArrowNeckVisible     = _bgReadSetting(panelKey, 'slideArrowNeckVisible');
             slideArrowChainPreviewVisible = _bgReadSetting(panelKey, 'slideArrowChainPreviewVisible');
+            // Whammy-model preview. Model id + fret offset are read as-is; the
+            // depth slider (0..1) maps to up to ~250*K back up the highway
+            // (negative Z, off the strings), and height (0..1, 0.5 = strings)
+            // to a ±40*K vertical offset.
+            whammyModel      = _bgReadSetting(panelKey, 'whammyModel');
+            whammyFollow     = _bgReadSetting(panelKey, 'whammyFollow');
+            whammyFretOffset = _bgReadSetting(panelKey, 'whammyFretOffset');
+            whammyHeightY    = (_bgReadSetting(panelKey, 'whammyHeight') - 0.5) * 2 * 40 * K;
+            whammyPreviewAlways = _bgReadSetting(panelKey, 'whammyPreviewAlways');
+            // Depth is per-mode (follow vs fixed distance-off-strings slider).
+            const _wDepthRaw = _bgReadSetting(panelKey, whammyFollow ? 'whammyDepthFollow' : 'whammyDepthFixed');
+            whammyDepthZ     = -(_wDepthRaw * 250 * K);
+            // Fixed-mode position along the neck: 0..1 slider (0.5 = fret 24) →
+            // ±300*K offset.
+            whammyFixedXOffset = (_bgReadSetting(panelKey, 'whammyFixedPos') - 0.5) * 600 * K;
+            const _wc = _h3dHexToInt(_bgReadSetting(panelKey, 'whammyColor'));
+            whammyColorHex = (_wc == null) ? 0x4a60cf : _wc;
             _vibrancyIdleOp = 0.4  + 0.6  * vibrancy;
             _vibrancyProjOp = 0.15 + 0.35 * vibrancy;
             // Custom image asset is a single GLOBAL slot — bytes are
@@ -14853,11 +14982,197 @@
         }
 
         /* ── Teardown ────────────────────────────────────────────────────── */
+        // ── Whammy model preview — dispose / load / per-frame placement ─────
+        // Dispose the current model's GPU resources and detach it from the scene.
+        // Geometry/material refs are de-duped: the rim shell clones the body's
+        // geometry, so a naive traverse would dispose the same geometry twice.
+        function _disposeWhammyModel() {
+            if (!_whammyModel) return;
+            if (scene) scene.remove(_whammyModel);
+            const seenGeo = new Set(), seenMat = new Set();
+            _whammyModel.traverse((o) => {
+                if (!o.isMesh) return;
+                if (o.geometry && !seenGeo.has(o.geometry)) { seenGeo.add(o.geometry); o.geometry.dispose && o.geometry.dispose(); }
+                const mats = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
+                for (const m of mats) { if (m && !seenMat.has(m)) { seenMat.add(m); m.dispose && m.dispose(); } }
+            });
+            _whammyModel = null;
+        }
+
+        // Async-load WHAMMY_MODELS[id]. The callback recentres the model on its
+        // bounding-box centre (so it pivots about the middle), derives
+        // _whammyBaseScale so its largest dimension maps to ~40*K world units
+        // regardless of export scale, and swaps the model's raw (dark metal)
+        // materials for the game-consistent look: one translucent tinted body
+        // material with a tiny emissive glow, plus an additive inverted-hull rim
+        // (a scaled BackSide clone) for a subtle outline — both feed the existing
+        // bloom like the note gems. Opacity is animated per-frame via the stored
+        // material refs on pivot.userData. Guarded by _whammyGen so a load
+        // resolving after a model-switch or teardown is discarded.
+        function _loadWhammyModel(id) {
+            const url = WHAMMY_MODELS[id];
+            if (!url || !scene || !T) return;
+            const gen = ++_whammyGen;
+            loadGLTFLoader().then((GLTFLoader) => {
+                if (gen !== _whammyGen || !scene) return;
+                const loader = new GLTFLoader();
+                loader.load(url, (gltf) => {
+                    if (gen !== _whammyGen || !scene) return;
+                    const inner = gltf.scene;
+                    const box = new T.Box3().setFromObject(inner);
+                    const center = box.getCenter(new T.Vector3());
+                    const size = box.getSize(new T.Vector3());
+                    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+                    _whammyBaseScale = (40 * K) / maxDim;
+                    const bodyMat = new T.MeshLambertMaterial({
+                        color: WHAMMY_BODY_COLOR, emissive: WHAMMY_BODY_COLOR,
+                        emissiveIntensity: WHAMMY_BODY_EMISSIVE_I,
+                        transparent: true, opacity: WHAMMY_BODY_OPACITY, toneMapped: true,
+                    });
+                    inner.traverse((o) => { if (o.isMesh) o.material = bodyMat; });
+                    // Inverted-hull rim: a slightly larger BackSide clone, additive
+                    // + depthWrite:false, so a soft outline glows behind the body.
+                    const rimMat = new T.MeshBasicMaterial({
+                        color: WHAMMY_RIM_COLOR, transparent: true, opacity: WHAMMY_RIM_OPACITY,
+                        side: T.BackSide, depthWrite: false, blending: T.AdditiveBlending, toneMapped: true,
+                    });
+                    const rim = inner.clone(true);
+                    rim.traverse((o) => { if (o.isMesh) o.material = rimMat; });
+                    rim.scale.multiplyScalar(WHAMMY_RIM_SCALE);
+                    rim.renderOrder = 4;
+                    // Transform hierarchy so the bend can pivot about the BACK edge:
+                    //   pivot (world position + scale)
+                    //     └ animG (bend rotation, pivot = back edge)
+                    //         └ modelG (baked 270°, body+rim recentred on bbox centre)
+                    const modelG = new T.Group();
+                    inner.position.sub(center);
+                    rim.position.sub(center);
+                    modelG.add(rim);
+                    modelG.add(inner);
+                    modelG.rotation.set(WHAMMY_ROT_X, WHAMMY_ROT_Y, WHAMMY_ROT_Z);
+                    modelG.updateMatrixWorld(true);
+                    // Back edge = extreme end of the longer horizontal axis, in the
+                    // world-aligned (post-rotation) frame. animG pivots about it, so
+                    // the back stays put while the far (bar) end swings.
+                    const rbox = new T.Box3().setFromObject(modelG);
+                    const longIsX = (rbox.max.x - rbox.min.x) >= (rbox.max.z - rbox.min.z);
+                    const backPt = new T.Vector3(
+                        (rbox.max.x + rbox.min.x) / 2,
+                        (rbox.max.y + rbox.min.y) / 2,
+                        (rbox.max.z + rbox.min.z) / 2,
+                    );
+                    if (longIsX) backPt.x = WHAMMY_BACK_SIGN > 0 ? rbox.max.x : rbox.min.x;
+                    else         backPt.z = WHAMMY_BACK_SIGN > 0 ? rbox.max.z : rbox.min.z;
+                    const animG = new T.Group();
+                    modelG.position.sub(backPt);   // back edge → animG origin (bend pivot)
+                    animG.add(modelG);
+                    const pivot = new T.Group();
+                    pivot.add(animG);
+                    pivot.scale.setScalar(_whammyBaseScale * WHAMMY_SCALE_MUL);
+                    pivot.renderOrder = 5;
+                    pivot.visible = false;
+                    pivot.userData.bodyMat = bodyMat;
+                    pivot.userData.rimMat = rimMat;
+                    pivot.userData.animG = animG;
+                    scene.add(pivot);
+                    _whammyModel = pivot;
+                }, undefined, (err) => {
+                    console.error('[3D-Hwy] whammy model load failed:', id, err);
+                });
+            }).catch(() => { /* GLTFLoader import already logged */ });
+        }
+
+        // Fade envelope for the tied note. elapsed = now - note.t (<0 before the
+        // onset, >0 after). Ramp up over WHAMMY_FADE_IN before the onset, hold
+        // full across the note's own duration [onset, onset+dur], ramp down over
+        // WHAMMY_FADE_OUT after. Smoothstep for a soft edge.
+        function _whammyEnvelope(elapsed, dur) {
+            let a;
+            if (elapsed < 0) a = 1 - (-elapsed) / WHAMMY_FADE_IN;
+            else if (elapsed <= dur) a = 1;
+            else a = 1 - (elapsed - dur) / WHAMMY_FADE_OUT;
+            a = Math.max(0, Math.min(1, a));
+            return a * a * (3 - 2 * a);
+        }
+
+        // Per-frame: swap models when the dropdown changes, then place the model.
+        // TEMPORARY gating: it fades in on its trigger notes (harmonics for now).
+        // Position follows the mode — follow: at the tied note's fret + offset;
+        // fixed: parked past the highest fret. whammyPreviewAlways overrides the
+        // gate and pins it fully lit for positioning. The bend animation
+        // (whammy-bend-values.md) is not driven yet — no note type to map it to.
+        function _updateWhammy(bundle) {
+            if (!scene || !T) return;
+            if (whammyModel !== _whammyLoadedId) {
+                _disposeWhammyModel();
+                _whammyLoadedId = whammyModel;
+                if (whammyModel !== 'off') _loadWhammyModel(whammyModel);
+            }
+            if (!_whammyModel) return;
+
+            const now = (bundle && bundle.currentTime) || 0;
+            let alpha = 0, anchorFret = null;
+            if (whammyPreviewAlways) {
+                alpha = 1; anchorFret = null;   // always visible for positioning
+            } else {
+                // Pick the trigger note with the strongest fade envelope right now.
+                let bestA = 0, bestNote = null;
+                const notes = bundle && bundle.notes;
+                if (Array.isArray(notes) && notes.length) {
+                    let i = Math.max(0, lowerBoundT(notes, now - WHAMMY_LOOKBACK) - 1);
+                    const limit = now + WHAMMY_FADE_IN;
+                    for (; i < notes.length; i++) {
+                        const n = notes[i];
+                        if (n.t > limit) break;
+                        if (!_whammyIsTriggerNote(n)) continue;
+                        const dur = Math.max(n.sus || 0, WHAMMY_MIN_DUR);
+                        const a = _whammyEnvelope(now - n.t, dur);
+                        if (a > bestA) { bestA = a; bestNote = n; }
+                    }
+                }
+                if (!bestNote) { _whammyModel.visible = false; return; }
+                alpha = bestA; anchorFret = bestNote.f;
+            }
+            if (alpha <= 0.001) { _whammyModel.visible = false; return; }
+            _whammyModel.visible = true;
+
+            // Position depends on the follow/fixed mode. Follow: at the tied note's
+            // fret (play head in preview) plus the fret offset, at the height +
+            // depth. Fixed: parked past fret 24 by the fixed-position offset, at the
+            // fixed depth, centred vertically.
+            const dir = _leftyCached ? -1 : 1;
+            const stringMidY = (sY(0) + sY(nStr - 1)) / 2;
+            let modelX, modelY;
+            if (whammyFollow) {
+                const baseX = (anchorFret == null) ? curX : xFretMid(anchorFret);
+                modelX = baseX + dir * whammyFretOffset * FRET_WIDTH_MID;
+                modelY = stringMidY + whammyHeightY;
+            } else {
+                modelX = xFret(NFRETS) + dir * whammyFixedXOffset;
+                modelY = stringMidY;
+            }
+            _whammyModel.position.set(modelX, modelY, whammyDepthZ);
+            _whammyModel.scale.setScalar(_whammyBaseScale * WHAMMY_SCALE_MUL * (0.9 + 0.1 * alpha));
+            // NOTE: `animG` (the back-edge pivot) is reserved for the per-note-type
+            // bend animation — see whammy-bend-values.md. Not driven yet: harmonics
+            // are only a stand-in trigger and don't map to a dive/pull gesture.
+            // Live body colour + translucent fade (body + rim).
+            const bm = _whammyModel.userData.bodyMat, rm = _whammyModel.userData.rimMat;
+            if (bm) { bm.color.setHex(whammyColorHex); bm.emissive.setHex(whammyColorHex); bm.opacity = WHAMMY_BODY_OPACITY * alpha; }
+            if (rm) { rm.color.setHex(whammyColorHex); rm.opacity = WHAMMY_RIM_OPACITY * alpha; }
+        }
+
         function teardown() {
             // Background animations (#13). Drop the listener first so any
             // mid-teardown settings change doesn't try to rebuild a torn-
             // down scene; then dispose the active style's resources.
             if (_bgListener) { _bgUnsubscribe(_bgListener); _bgListener = null; }
+            // Whammy preview: invalidate any in-flight async load, dispose the
+            // model, and reset so a reused instance reloads from scratch.
+            _whammyGen++;
+            _disposeWhammyModel();
+            _whammyLoadedId = null;
+            _whammyBaseScale = 1;
             // WebGL context-loss listeners (bound in initScene on ren.domElement).
             // Remove before ren is disposed below so a torn-down instance can't
             // keep firing them; reset the flag so a reused instance starts clean.
@@ -15277,6 +15592,7 @@
                 }
                 update(bundle);
                 camUpdate(bundle);
+                _updateWhammy(bundle);   // whammy model preview: gating + placement + animation
 
                 // Background animations (#13). Compute frame dt once,
                 // read audio bands when reactivity is on, delegate to

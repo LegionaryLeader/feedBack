@@ -948,6 +948,176 @@
         </p>
     </div>
 
+    <!-- ═══════════════════════════════════════════════════════════════════
+         TEMPORARY: Whammy model preview (Floyd Rose tremolo).
+         A single self-contained section — controls + its own hydration
+         script below — so the whole feature can be deleted in one pass once
+         the transform is dialled in and gated to harmonic notes. All setters
+         are window.h3dBgSetWhammy* (defined in screen.js). -->
+    <!-- Prominent divider + header so this temporary block is easy to find. -->
+    <div class="mt-6 border-t border-gray-700"></div>
+    <div role="group" aria-labelledby="h3d-whammy-heading" class="mt-4">
+        <h3 id="h3d-whammy-heading" class="text-sm text-gray-200 uppercase mb-1">⚙ Whammy Model</h3>
+        <p class="text-xs text-gray-500 mb-3">
+            The tremolo-bridge model on the neck. It fades in + animates on its
+            tied notes (harmonics, temporarily, until the real whammy note type
+            exists). Turn on “Always show” to tune position freely.
+        </p>
+
+        <!-- Model picker (Off or one of the three models) -->
+        <div class="mt-1">
+            <label for="h3d-whammy-model" class="text-xs font-medium text-gray-400 mb-1 block">Model</label>
+            <select id="h3d-whammy-model"
+                onchange="window.h3dBgSetWhammyModel && window.h3dBgSetWhammyModel(this.value)"
+                class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+                <option value="off">Off (hidden)</option>
+                <option value="01" selected>Whammy 01</option>
+                <option value="02">Whammy 02 (straight)</option>
+                <option value="03">Whammy 03 (simple)</option>
+            </select>
+        </div>
+
+        <!-- Preview override: show continuously for positioning -->
+        <div class="mt-2">
+            <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                <input type="checkbox" id="h3d-whammy-preview-always"
+                       onchange="window.h3dBgSetWhammyPreviewAlways && window.h3dBgSetWhammyPreviewAlways(this.checked)"
+                       class="accent-accent">
+                Always show (preview / positioning)
+            </label>
+            <p class="text-[10px] text-gray-500 mt-1 ml-6">
+                Off: fades in only on the tied notes (harmonics, temporarily).
+                On: shows continuously at the play head so you can tune position.
+            </p>
+        </div>
+
+        <!-- Body colour -->
+        <div class="mt-3">
+            <label for="h3d-whammy-color" class="text-xs font-medium text-gray-400 mb-1 block">Colour</label>
+            <input type="color" id="h3d-whammy-color" value="#4a60cf"
+                onchange="window.h3dBgSetWhammyColor && window.h3dBgSetWhammyColor(this.value)"
+                class="h-9 w-full max-w-[12rem] cursor-pointer rounded border border-gray-800 bg-dark-700 p-0.5">
+        </div>
+
+        <!-- Follow the chart vs park past the highest fret -->
+        <div class="mt-3">
+            <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                <input type="checkbox" id="h3d-whammy-follow" checked
+                       onchange="window.h3dBgSetWhammyFollow && window.h3dBgSetWhammyFollow(this.checked); window.h3dWhammyFollowUI && window.h3dWhammyFollowUI(this.checked)"
+                       class="accent-accent">
+                Follow the chart
+            </label>
+            <p class="text-[10px] text-gray-500 mt-1 ml-6">
+                On: tracks the notes at the fret offset below. Off: parks just past
+                the highest fret (24). Each mode keeps its own settings below.
+            </p>
+        </div>
+
+        <!-- FOLLOW-mode controls (shown when "Follow the chart" is on) -->
+        <div id="h3d-whammy-follow-group">
+            <div class="mt-3">
+                <label for="h3d-whammy-fret-offset" class="text-xs font-medium text-gray-400 mb-1 block">
+                    Fret offset: <span id="h3d-whammy-fret-offset-label">10</span> fret(s) right
+                </label>
+                <input type="range" id="h3d-whammy-fret-offset" min="1" max="12" step="1" value="10"
+                    oninput="document.getElementById('h3d-whammy-fret-offset-label').textContent = this.value; window.h3dBgSetWhammyFretOffset && window.h3dBgSetWhammyFretOffset(this.value)"
+                    onchange="window.h3dBgSetWhammyFretOffset && window.h3dBgSetWhammyFretOffset(this.value)"
+                    class="w-full accent-accent">
+                <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>1</span><span>12</span></div>
+            </div>
+            <div class="mt-3">
+                <label for="h3d-whammy-depth-follow" class="text-xs font-medium text-gray-400 mb-1 block">
+                    Distance off strings: <span id="h3d-whammy-depth-follow-label">0.05</span>
+                </label>
+                <input type="range" id="h3d-whammy-depth-follow" min="0" max="1" step="0.01" value="0.05"
+                    oninput="document.getElementById('h3d-whammy-depth-follow-label').textContent = parseFloat(this.value).toFixed(2); window.h3dBgSetWhammyDepthFollow && window.h3dBgSetWhammyDepthFollow(this.value)"
+                    onchange="window.h3dBgSetWhammyDepthFollow && window.h3dBgSetWhammyDepthFollow(this.value)"
+                    class="w-full accent-accent">
+                <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>At strings</span><span>Toward notes</span></div>
+            </div>
+            <div class="mt-3">
+                <label for="h3d-whammy-height" class="text-xs font-medium text-gray-400 mb-1 block">
+                    Height: <span id="h3d-whammy-height-label">0.70</span>
+                </label>
+                <input type="range" id="h3d-whammy-height" min="0" max="1" step="0.01" value="0.7"
+                    oninput="document.getElementById('h3d-whammy-height-label').textContent = parseFloat(this.value).toFixed(2); window.h3dBgSetWhammyHeight && window.h3dBgSetWhammyHeight(this.value)"
+                    onchange="window.h3dBgSetWhammyHeight && window.h3dBgSetWhammyHeight(this.value)"
+                    class="w-full accent-accent">
+                <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>Lower</span><span>Higher</span></div>
+            </div>
+        </div>
+
+        <!-- FIXED-mode controls (shown when "Follow the chart" is off) -->
+        <div id="h3d-whammy-fixed-group" style="display:none">
+            <div class="mt-3">
+                <label for="h3d-whammy-depth-fixed" class="text-xs font-medium text-gray-400 mb-1 block">
+                    Distance off strings: <span id="h3d-whammy-depth-fixed-label">0.02</span>
+                </label>
+                <input type="range" id="h3d-whammy-depth-fixed" min="0" max="1" step="0.01" value="0.02"
+                    oninput="document.getElementById('h3d-whammy-depth-fixed-label').textContent = parseFloat(this.value).toFixed(2); window.h3dBgSetWhammyDepthFixed && window.h3dBgSetWhammyDepthFixed(this.value)"
+                    onchange="window.h3dBgSetWhammyDepthFixed && window.h3dBgSetWhammyDepthFixed(this.value)"
+                    class="w-full accent-accent">
+                <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>At strings</span><span>Toward notes</span></div>
+            </div>
+            <div class="mt-3">
+                <label for="h3d-whammy-fixed-pos" class="text-xs font-medium text-gray-400 mb-1 block">
+                    Position along neck: <span id="h3d-whammy-fixed-pos-label">0.500</span>
+                </label>
+                <input type="range" id="h3d-whammy-fixed-pos" min="0" max="1" step="0.005" value="0.5"
+                    oninput="document.getElementById('h3d-whammy-fixed-pos-label').textContent = parseFloat(this.value).toFixed(3); window.h3dBgSetWhammyFixedPos && window.h3dBgSetWhammyFixedPos(this.value)"
+                    onchange="window.h3dBgSetWhammyFixedPos && window.h3dBgSetWhammyFixedPos(this.value)"
+                    class="w-full accent-accent">
+                <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>Toward neck</span><span>Past fret 24</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TEMPORARY: self-contained hydration for the whammy section. Kept
+         separate from the main hydration IIFE below so the whole feature
+         deletes cleanly. Mirrors screen.js BG_DEFAULTS for the whammy* keys. -->
+    <script>
+        (function () {
+            const D = { whammyModel: '01', whammyFollow: true, whammyColor: '#4a60cf', whammyFretOffset: 10, whammyDepthFollow: 0.05, whammyHeight: 0.70, whammyDepthFixed: 0.02, whammyFixedPos: 0.5, whammyPreviewAlways: false };
+            const MODEL_IDS = ['off', '01', '02', '03'];
+            const num = (v, fb, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : fb; };
+            const bool = (v, fb) => (v === 'true' || v === '1') ? true : (v === 'false' || v === '0') ? false : fb;
+            const get = (k) => { try { return localStorage.getItem('h3d_bg_' + k); } catch (_) { return null; } };
+            const md = (() => { const s = get('whammyModel'); return (s !== null && MODEL_IDS.includes(s)) ? s : D.whammyModel; })();
+            const fl = (() => { const s = get('whammyFollow'); return s === null ? D.whammyFollow : bool(s, D.whammyFollow); })();
+            const pa = (() => { const s = get('whammyPreviewAlways'); return s === null ? D.whammyPreviewAlways : bool(s, D.whammyPreviewAlways); })();
+            const fo = (() => { const s = get('whammyFretOffset'); return s === null ? D.whammyFretOffset : Math.round(num(s, D.whammyFretOffset, 1, 12)); })();
+            const df = (() => { const s = get('whammyDepthFollow'); return s === null ? D.whammyDepthFollow : num(s, D.whammyDepthFollow, 0, 1); })();
+            const ht = (() => { const s = get('whammyHeight'); return s === null ? D.whammyHeight : num(s, D.whammyHeight, 0, 1); })();
+            const dx = (() => { const s = get('whammyDepthFixed'); return s === null ? D.whammyDepthFixed : num(s, D.whammyDepthFixed, 0, 1); })();
+            const fp = (() => { const s = get('whammyFixedPos'); return s === null ? D.whammyFixedPos : num(s, D.whammyFixedPos, 0, 1); })();
+            const col = (() => { const s = get('whammyColor'); return (typeof s === 'string' && /^#[0-9a-fA-F]{6}$/.test(s.trim())) ? s.trim().toLowerCase() : D.whammyColor; })();
+            const set = (id, prop, val) => { const el = document.getElementById(id); if (el) el[prop] = val; };
+            const txt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+            // Show only the active mode's controls; also called from the checkbox.
+            window.h3dWhammyFollowUI = function (on) {
+                const fg = document.getElementById('h3d-whammy-follow-group');
+                const xg = document.getElementById('h3d-whammy-fixed-group');
+                if (fg) fg.style.display = on ? '' : 'none';
+                if (xg) xg.style.display = on ? 'none' : '';
+            };
+            set('h3d-whammy-model', 'value', md);
+            set('h3d-whammy-preview-always', 'checked', pa);
+            set('h3d-whammy-color', 'value', col);
+            set('h3d-whammy-follow', 'checked', fl);
+            set('h3d-whammy-fret-offset', 'value', String(fo));
+            txt('h3d-whammy-fret-offset-label', String(fo));
+            set('h3d-whammy-depth-follow', 'value', String(df));
+            txt('h3d-whammy-depth-follow-label', df.toFixed(2));
+            set('h3d-whammy-height', 'value', String(ht));
+            txt('h3d-whammy-height-label', ht.toFixed(2));
+            set('h3d-whammy-depth-fixed', 'value', String(dx));
+            txt('h3d-whammy-depth-fixed-label', dx.toFixed(2));
+            set('h3d-whammy-fixed-pos', 'value', String(fp));
+            txt('h3d-whammy-fixed-pos-label', fp.toFixed(3));
+            window.h3dWhammyFollowUI(fl);
+        })();
+    </script>
+
     <!-- Hydrate from localStorage on load. Mirror runtime defaults AND
          coercion rules from screen.js's BG_DEFAULTS / _bgCoerce so first-
          run users see what the renderer actually drew, and any garbage
